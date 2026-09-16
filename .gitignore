@@ -1,0 +1,27 @@
+# ESP-IDF build artifacts
+build/
+**/build/
+.cache/
+**/.cache/
+sdkconfig.old
+sdkconfig.bak
+**/*.bak
+*.exe
+tools/*.exe
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+
+# Editor / OS artifacts
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
