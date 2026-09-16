@@ -45,6 +45,16 @@ typedef void (*audio_player_media_ctrl_cb_t)(audio_player_cmd_t cmd);
 void audio_player_set_media_ctrl_cb(audio_player_media_ctrl_cb_t cb);
 
 /**
+ * @brief Set digital volume percentage (0 to 100).
+ */
+void audio_player_set_volume(uint8_t volume_pct);
+
+/**
+ * @brief Get current digital volume percentage.
+ */
+uint8_t audio_player_get_volume(void);
+
+/**
  * @brief Initialize the audio player engine.
  */
 esp_err_t audio_player_init(void);

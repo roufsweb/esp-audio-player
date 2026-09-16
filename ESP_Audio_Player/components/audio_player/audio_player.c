@@ -19,10 +19,23 @@ static SemaphoreHandle_t s_lock = NULL;
 static audio_player_state_t s_state = AUDIO_STATE_STOPPED;
 static audio_player_source_t s_source = AUDIO_SOURCE_SINE;
 static audio_player_media_ctrl_cb_t s_media_ctrl_cb = NULL;
+static uint8_t s_volume = 100;
 
 void audio_player_set_media_ctrl_cb(audio_player_media_ctrl_cb_t cb)
 {
     s_media_ctrl_cb = cb;
+}
+
+void audio_player_set_volume(uint8_t volume_pct)
+{
+    if (volume_pct > 100) volume_pct = 100;
+    s_volume = volume_pct;
+    ESP_LOGI(TAG, "Audio player digital volume set to %d%%", s_volume);
+}
+
+uint8_t audio_player_get_volume(void)
+{
+    return s_volume;
 }
 
 /* Sine wave state */
@@ -215,6 +228,15 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
         }
     } else {
         memset(data, 0, len);
+    }
+
+    if (s_volume < 100) {
+        int16_t *samples = (int16_t *)data;
+        int num_samples = len / 2;
+        int32_t vol = s_volume;
+        for (int i = 0; i < num_samples; i++) {
+            samples[i] = (int16_t)((samples[i] * vol) / 100);
+        }
     }
 
     xSemaphoreGive(s_lock);

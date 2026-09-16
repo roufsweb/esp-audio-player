@@ -20,65 +20,10 @@
 #include "audio_player.h"
 #include "wifi_manager.h"
 #include "web_server.h"
+#include "bt_manager.h"
 
 static const char *TAG = "A2DP_SRC";
 
-
-/* GAP callback */
-static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
-{
-    switch (event) {
-    case ESP_BT_GAP_DISC_RES_EVT: {
-        for (int i = 0; i < param->disc_res.num_prop; i++) {
-            if (param->disc_res.prop[i].type == ESP_BT_GAP_DEV_PROP_BDNAME) {
-                char bda_str[18];
-                snprintf(bda_str, sizeof(bda_str), "%02x:%02x:%02x:%02x:%02x:%02x", 
-                         param->disc_res.bda[0], param->disc_res.bda[1], param->disc_res.bda[2],
-                         param->disc_res.bda[3], param->disc_res.bda[4], param->disc_res.bda[5]);
-                
-                /* Ensure name is null-terminated based on len */
-                int name_len = param->disc_res.prop[i].len;
-                char name[64] = {0};
-                if (name_len > 63) name_len = 63;
-                memcpy(name, param->disc_res.prop[i].val, name_len);
-                
-                ESP_LOGI(TAG, "Device Discovered -> Name: '%s', MAC: %s", name, bda_str);
-            }
-        }
-        break;
-    }
-    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
-        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-            ESP_LOGI(TAG, "Discovery stopped.");
-        } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
-            ESP_LOGI(TAG, "Discovery started. Looking for devices...");
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-/* A2DP callback */
-static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
-{
-    switch (event) {
-    case ESP_A2D_CONNECTION_STATE_EVT:
-        if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            ESP_LOGI(TAG, "A2DP Connected successfully!");
-        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            ESP_LOGI(TAG, "A2DP Disconnected.");
-        }
-        break;
-    case ESP_A2D_AUDIO_STATE_EVT:
-        if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-            ESP_LOGI(TAG, "A2DP Audio Stream Started.");
-        }
-        break;
-    default:
-        break;
-    }
-}
 
 /* Audio data callback - pulls decoded PCM from the audio player engine */
 static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
@@ -89,7 +34,7 @@ static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
 /* --- CONSOLE COMMAND HANDLERS --- */
 static int cmd_scan(int argc, char **argv) {
     ESP_LOGI(TAG, "Initiating scan for nearby Bluetooth devices...");
-    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+    bt_manager_start_scan(10);
     return 0;
 }
 
@@ -99,53 +44,47 @@ static int cmd_connect(int argc, char **argv) {
         ESP_LOGE(TAG, "Usage: connect xx:xx:xx:xx:xx:xx");
         return 1;
     }
-    
-    esp_bd_addr_t bda;
-    int mac[6];
-    if (sscanf(argv[1], "%02x:%02x:%02x:%02x:%02x:%02x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-        for(int i=0; i<6; i++) {
-            bda[i] = (uint8_t)mac[i];
-        }
-        ESP_LOGI(TAG, "Attempting connection to %02x:%02x:%02x:%02x:%02x:%02x...", bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-        esp_a2d_source_connect(bda);
-    } else {
-        ESP_LOGE(TAG, "Invalid MAC address format. Use xx:xx:xx:xx:xx:xx");
+    esp_err_t err = bt_manager_connect_str(argv[1]);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Invalid MAC format or connection failed: %s", esp_err_to_name(err));
+        return 1;
     }
     return 0;
 }
 
 static int cmd_disconnect(int argc, char **argv) {
+    ESP_LOGI(TAG, "Disconnecting from A2DP sink...");
+    bt_manager_disconnect();
+    return 0;
+}
+
+static int cmd_volume(int argc, char **argv) {
     if (argc < 2) {
-        ESP_LOGE(TAG, "Error: You must provide a MAC address to disconnect.");
-        return 1;
+        printf("Current volume: %u%%\n", audio_player_get_volume());
+        return 0;
     }
-    esp_bd_addr_t bda;
-    int mac[6];
-    if (sscanf(argv[1], "%02x:%02x:%02x:%02x:%02x:%02x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-        for(int i=0; i<6; i++) bda[i] = (uint8_t)mac[i];
-        ESP_LOGI(TAG, "Disconnecting...");
-        esp_a2d_source_disconnect(bda);
-    }
+    int vol = atoi(argv[1]);
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    audio_player_set_volume((uint8_t)vol);
+    printf("Volume set to %d%%\n", vol);
     return 0;
 }
 
 static int cmd_play(int argc, char **argv) {
     audio_player_play();
-    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
     printf("Playback resumed.\n");
     return 0;
 }
 
 static int cmd_pause(int argc, char **argv) {
     audio_player_pause();
-    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
     printf("Playback paused.\n");
     return 0;
 }
 
 static int cmd_stop(int argc, char **argv) {
     audio_player_stop();
-    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
     printf("Playback stopped.\n");
     return 0;
 }
@@ -255,6 +194,14 @@ void register_console_commands(void)
     };
     esp_console_cmd_register(&tone_cmd);
 
+    esp_console_cmd_t volume_cmd = {
+        .command = "volume",
+        .help = "Get or set digital volume (0-100%)",
+        .hint = "[percentage]",
+        .func = &cmd_volume,
+    };
+    esp_console_cmd_register(&volume_cmd);
+
     esp_console_cmd_t status_cmd = {
         .command = "status",
         .help = "Display current audio playback status and progress",
@@ -332,11 +279,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
 
+    /* Initialize Bluetooth Manager */
+    ESP_ERROR_CHECK(bt_manager_init());
+
     /* Register GAP callback */
-    ESP_ERROR_CHECK(esp_bt_gap_register_callback(bt_app_gap_cb));
+    ESP_ERROR_CHECK(esp_bt_gap_register_callback(bt_manager_gap_cb));
 
     /* Initialize A2DP Source */
-    ESP_ERROR_CHECK(esp_a2d_register_callback(bt_app_a2d_cb));
+    ESP_ERROR_CHECK(esp_a2d_register_callback(bt_manager_a2d_cb));
     ESP_ERROR_CHECK(esp_a2d_source_register_data_callback(bt_app_a2d_data_cb));
     ESP_ERROR_CHECK(esp_a2d_source_init());
 
