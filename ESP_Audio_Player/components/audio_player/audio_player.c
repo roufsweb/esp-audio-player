@@ -18,6 +18,12 @@ static const char *TAG = "AUDIO_PLAYER";
 static SemaphoreHandle_t s_lock = NULL;
 static audio_player_state_t s_state = AUDIO_STATE_STOPPED;
 static audio_player_source_t s_source = AUDIO_SOURCE_SINE;
+static audio_player_media_ctrl_cb_t s_media_ctrl_cb = NULL;
+
+void audio_player_set_media_ctrl_cb(audio_player_media_ctrl_cb_t cb)
+{
+    s_media_ctrl_cb = cb;
+}
 
 /* Sine wave state */
 static double s_sine_phase = 0.0;
@@ -266,6 +272,7 @@ esp_err_t audio_player_play_file(const char *path)
              duration_sec, (unsigned long)(data_len / 1024));
 
     xSemaphoreGive(s_lock);
+    if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
 
@@ -291,6 +298,7 @@ esp_err_t audio_player_set_tone(double freq_hz)
 
     ESP_LOGI(TAG, "Audio source set to Sine Tone: %.1f Hz", freq_hz);
     xSemaphoreGive(s_lock);
+    if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
 
@@ -300,6 +308,7 @@ esp_err_t audio_player_play(void)
     s_state = AUDIO_STATE_PLAYING;
     ESP_LOGI(TAG, "Audio playback resumed.");
     xSemaphoreGive(s_lock);
+    if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
 
@@ -309,6 +318,7 @@ esp_err_t audio_player_pause(void)
     s_state = AUDIO_STATE_PAUSED;
     ESP_LOGI(TAG, "Audio playback paused.");
     xSemaphoreGive(s_lock);
+    if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_SUSPEND);
     return ESP_OK;
 }
 
@@ -323,6 +333,7 @@ esp_err_t audio_player_stop(void)
     s_wav_played_bytes = 0;
     ESP_LOGI(TAG, "Audio playback stopped.");
     xSemaphoreGive(s_lock);
+    if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_STOP);
     return ESP_OK;
 }
 

@@ -18,6 +18,8 @@
 #include "esp_heap_caps.h"
 #include "sd_card.h"
 #include "audio_player.h"
+#include "wifi_manager.h"
+#include "web_server.h"
 
 static const char *TAG = "A2DP_SRC";
 
@@ -270,6 +272,25 @@ void register_console_commands(void)
     esp_console_cmd_register(&restart_cmd);
 }
 
+static void main_media_ctrl_cb(audio_player_cmd_t cmd)
+{
+    if (cmd == AUDIO_PLAYER_CMD_START) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+    } else if (cmd == AUDIO_PLAYER_CMD_SUSPEND) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    } else if (cmd == AUDIO_PLAYER_CMD_STOP) {
+        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_STOP);
+    }
+}
+
+static void on_wifi_state_change(bool connected, const char *ip_str)
+{
+    if (connected) {
+        ESP_LOGI(TAG, "Wi-Fi link established! Starting Web Dashboard at http://%s...", ip_str);
+        web_server_start();
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Initializing ESP Audio Player (A2DP Source)...");
@@ -284,6 +305,7 @@ void app_main(void)
 
     /* Initialize Audio Player Engine */
     ESP_ERROR_CHECK(audio_player_init());
+    audio_player_set_media_ctrl_cb(main_media_ctrl_cb);
 
     /* Test and verify external PSRAM */
     size_t psram_size = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -328,6 +350,13 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not detected or mount failed (%s). Playback from SD is unavailable until inserted.", esp_err_to_name(sd_ret));
     }
 
+    /* Initialize Wi-Fi subsystem (SSID: rouf.iot) */
+    wifi_manager_register_state_callback(on_wifi_state_change);
+    esp_err_t wifi_ret = wifi_manager_init();
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi initialization failed: %s", esp_err_to_name(wifi_ret));
+    }
+
     /* Initialize Interactive Console */
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -339,6 +368,7 @@ void app_main(void)
 
     register_console_commands();
     sd_card_register_console_commands();
+    wifi_manager_register_console_commands();
     
     ESP_LOGI(TAG, "Initialization complete. Type 'help' for a list of commands.");
     ESP_ERROR_CHECK(esp_console_start_repl(repl));

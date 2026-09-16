@@ -31,6 +31,19 @@ typedef struct {
     uint32_t played_audio_bytes;
 } audio_player_status_t;
 
+typedef enum {
+    AUDIO_PLAYER_CMD_START = 0,
+    AUDIO_PLAYER_CMD_SUSPEND,
+    AUDIO_PLAYER_CMD_STOP
+} audio_player_cmd_t;
+
+typedef void (*audio_player_media_ctrl_cb_t)(audio_player_cmd_t cmd);
+
+/**
+ * @brief Register optional media control callback (e.g. A2DP stream start/stop).
+ */
+void audio_player_set_media_ctrl_cb(audio_player_media_ctrl_cb_t cb);
+
 /**
  * @brief Initialize the audio player engine.
  */

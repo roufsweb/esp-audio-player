@@ -173,6 +173,8 @@ def main():
     target_port = "COM12"
     baud = 460800
     skip_compile = "--skip-compile" in sys.argv
+    compile_only = "--compile-only" in sys.argv or "--build-only" in sys.argv
+    do_reconfigure = "--reconfigure" in sys.argv
     do_monitor = "--monitor" in sys.argv or "-m" in sys.argv
     no_reset = "--no-reset" in sys.argv
     retries = 5
@@ -185,22 +187,38 @@ def main():
         elif arg == "--retries" and i + 1 < len(sys.argv):
             retries = int(sys.argv[i + 1])
 
-    ports = get_ports()
-    if target_port not in ports:
-        print(f"[-] Port {target_port} not found! Available ports: {ports}")
-        if ports:
-            print(f"[*] Using first available: {ports[0]}")
-            target_port = ports[0]
-        else:
-            sys.exit(1)
+    if do_reconfigure:
+        print("=" * 60)
+        print("[*] Running idf.py reconfigure...")
+        print("=" * 60)
+        env = setup_environment()
+        reconfig_cmd = [
+            IDF_PYTHON,
+            os.path.join(IDF_TOOLS_DIR, "idf.py"),
+            "reconfigure"
+        ]
+        subprocess.run(reconfig_cmd, cwd=PROJECT_DIR, env=env, check=True)
 
-    print(f"[+] Target Device: {target_port} | Flashing Baud: {baud}")
+    if not compile_only:
+        ports = get_ports()
+        if target_port not in ports:
+            print(f"[-] Port {target_port} not found! Available ports: {ports}")
+            if ports:
+                print(f"[*] Using first available: {ports[0]}")
+                target_port = ports[0]
+            else:
+                sys.exit(1)
+
+        print(f"[+] Target Device: {target_port} | Flashing Baud: {baud}")
 
     # 1. Compile
     if not skip_compile:
         if not compile_project():
             print("[-] Compilation failed! Aborting upload.")
             sys.exit(1)
+        if compile_only:
+            print("[+] Build complete (--compile-only flag active). Exiting successfully.")
+            sys.exit(0)
     else:
         print("[*] Skipping compilation as requested.")
 
