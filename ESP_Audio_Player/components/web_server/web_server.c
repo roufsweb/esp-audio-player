@@ -567,7 +567,7 @@ static esp_err_t get_bt_devices_handler(httpd_req_t *req)
 /* POST /api/bt/connect - Connect to MAC */
 static esp_err_t post_bt_connect_handler(httpd_req_t *req)
 {
-    char target_mac[32] = {0};
+    char target_mac[64] = {0};
     char query[128] = {0};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         httpd_query_key_value(query, "mac", target_mac, sizeof(target_mac));
@@ -577,17 +577,21 @@ static esp_err_t post_bt_connect_handler(httpd_req_t *req)
         if (r > 0) target_mac[r] = '\0';
     }
 
-    if (target_mac[0] == '\0') {
+    char decoded_mac[64] = {0};
+    url_decode(decoded_mac, target_mac, sizeof(decoded_mac));
+
+    if (decoded_mac[0] == '\0') {
         const char *err = "{\"status\":\"error\",\"message\":\"Missing mac parameter\"}";
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, err, HTTPD_RESP_USE_STRLEN);
     }
 
-    esp_err_t err = bt_manager_connect_str(target_mac);
+    ESP_LOGI(TAG, "Web request to connect to Bluetooth device: '%s'", decoded_mac);
+    esp_err_t err = bt_manager_connect_str(decoded_mac);
     char resp[128];
     snprintf(resp, sizeof(resp), "{\"status\":\"%s\",\"mac\":\"%s\"}",
-             err == ESP_OK ? "connecting" : "failed", target_mac);
+             err == ESP_OK ? "connecting" : "failed", decoded_mac);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }

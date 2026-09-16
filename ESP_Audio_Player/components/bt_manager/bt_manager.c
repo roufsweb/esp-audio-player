@@ -3,10 +3,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
 
 static const char *TAG = "BT_MGR";
 
@@ -36,7 +40,21 @@ esp_err_t bt_manager_init(void)
     s_audio_state = BT_MGR_AUDIO_STATE_SUSPEND;
     s_device_count = 0;
     memset(s_devices, 0, sizeof(s_devices));
-    ESP_LOGI(TAG, "Bluetooth Manager initialized successfully.");
+    memset(s_connected_bda, 0, sizeof(s_connected_bda));
+    s_connected_bda_str[0] = '\0';
+    s_connected_name[0] = '\0';
+
+    /* Configure Secure Simple Pairing (SSP) with "No Input No Output" for auto Just Works pairing */
+    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
+
+    /* Set default PIN response */
+    esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
+    esp_bt_pin_code_t pin_code;
+    esp_bt_gap_set_pin(pin_type, 0, pin_code);
+
+    ESP_LOGI(TAG, "Bluetooth Manager initialized with SSP & auto-pairing support.");
     return ESP_OK;
 }
 
@@ -100,10 +118,39 @@ void bt_manager_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
         if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
             s_is_scanning = false;
-            ESP_LOGI(TAG, "Bluetooth discovery completed. Total devices found: %d", s_device_count);
+            ESP_LOGI(TAG, "Bluetooth discovery stopped. Total devices found: %d", s_device_count);
         } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
             s_is_scanning = true;
             ESP_LOGI(TAG, "Bluetooth discovery started...");
+        }
+        break;
+
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        ESP_LOGI(TAG, "ESP_BT_GAP_CFM_REQ_EVT (Just Works confirmation for %06lu). Auto-confirming...",
+                 (unsigned long)param->cfm_req.num_val);
+        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        break;
+
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        ESP_LOGI(TAG, "ESP_BT_GAP_KEY_NOTIF_EVT passkey: %06lu", (unsigned long)param->key_notif.passkey);
+        break;
+
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        ESP_LOGI(TAG, "ESP_BT_GAP_KEY_REQ_EVT: passkey requested");
+        break;
+
+    case ESP_BT_GAP_PIN_REQ_EVT: {
+        ESP_LOGI(TAG, "ESP_BT_GAP_PIN_REQ_EVT: replying default PIN 0000");
+        esp_bt_pin_code_t pin_code = {'0', '0', '0', '0'};
+        esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
+        break;
+    }
+
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGI(TAG, "Bluetooth Authentication SUCCESS with '%s'", param->auth_cmpl.device_name);
+        } else {
+            ESP_LOGE(TAG, "Bluetooth Authentication FAILED with status: %d", param->auth_cmpl.stat);
         }
         break;
 
@@ -135,19 +182,19 @@ void bt_manager_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 if (s_connected_name[0] == '\0') {
                     strncpy(s_connected_name, "Bluetooth Audio Sink", sizeof(s_connected_name) - 1);
                 }
-                ESP_LOGI(TAG, "A2DP Connected: %s [%s]", s_connected_name, s_connected_bda_str);
+                ESP_LOGI(TAG, "A2DP Connected successfully: %s [%s]", s_connected_name, s_connected_bda_str);
             } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
                 s_a2d_state = BT_MGR_A2D_STATE_CONNECTING;
-                ESP_LOGI(TAG, "A2DP Connecting...");
+                ESP_LOGI(TAG, "A2DP Connecting in progress...");
             } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTING) {
                 s_a2d_state = BT_MGR_A2D_STATE_DISCONNECTING;
-                ESP_LOGI(TAG, "A2DP Disconnecting...");
+                ESP_LOGI(TAG, "A2DP Disconnecting in progress...");
             } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 s_a2d_state = BT_MGR_A2D_STATE_DISCONNECTED;
                 memset(s_connected_bda, 0, sizeof(s_connected_bda));
                 s_connected_bda_str[0] = '\0';
                 s_connected_name[0] = '\0';
-                ESP_LOGI(TAG, "A2DP Disconnected.");
+                ESP_LOGW(TAG, "A2DP Disconnected (reason: %d)", param->conn_stat.disc_rsn);
             }
             xSemaphoreGive(s_bt_lock);
         }
@@ -195,26 +242,91 @@ bool bt_manager_is_scanning(void)
 
 esp_err_t bt_manager_connect(const esp_bd_addr_t bda)
 {
-    s_a2d_state = BT_MGR_A2D_STATE_CONNECTING;
-    ESP_LOGI(TAG, "Connecting to %02x:%02x:%02x:%02x:%02x:%02x...",
+    /* 1. Stop active inquiry scan immediately if running so baseband radio can page target */
+    if (s_is_scanning) {
+        ESP_LOGI(TAG, "Stopping active inquiry scan before initiating A2DP connection...");
+        esp_bt_gap_cancel_discovery();
+        s_is_scanning = false;
+        vTaskDelay(pdMS_TO_TICKS(150)); /* Allow radio baseband to settle */
+    }
+
+    if (xSemaphoreTake(s_bt_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+        /* 2. Disconnect previous connection if any */
+        if (s_a2d_state == BT_MGR_A2D_STATE_CONNECTED) {
+            ESP_LOGI(TAG, "Disconnecting previous A2DP link...");
+            esp_a2d_source_disconnect(s_connected_bda);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+
+        s_a2d_state = BT_MGR_A2D_STATE_CONNECTING;
+        memcpy(s_connected_bda, bda, ESP_BD_ADDR_LEN);
+        snprintf(s_connected_bda_str, sizeof(s_connected_bda_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+
+        /* Find device name if known in cache */
+        s_connected_name[0] = '\0';
+        for (int i = 0; i < s_device_count; i++) {
+            if (memcmp(s_devices[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
+                strncpy(s_connected_name, s_devices[i].name, sizeof(s_connected_name) - 1);
+                break;
+            }
+        }
+        if (s_connected_name[0] == '\0') {
+            strncpy(s_connected_name, "Connecting Device...", sizeof(s_connected_name) - 1);
+        }
+
+        xSemaphoreGive(s_bt_lock);
+    }
+
+    ESP_LOGI(TAG, "Attempting A2DP Source connection to %02x:%02x:%02x:%02x:%02x:%02x...",
              bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-    return esp_a2d_source_connect((uint8_t *)bda);
+
+    esp_err_t err = esp_a2d_source_connect((uint8_t *)bda);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_a2d_source_connect failed: %s (0x%x)", esp_err_to_name(err), err);
+        if (xSemaphoreTake(s_bt_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            s_a2d_state = BT_MGR_A2D_STATE_DISCONNECTED;
+            xSemaphoreGive(s_bt_lock);
+        }
+    }
+    return err;
 }
 
 esp_err_t bt_manager_connect_str(const char *mac_str)
 {
-    if (!mac_str || strlen(mac_str) < 17) {
+    if (!mac_str || strlen(mac_str) < 12) {
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* URL-decode if %3A or %3a exists */
+    char clean[64] = {0};
+    int d = 0;
+    const char *s = mac_str;
+    while (*s && d < sizeof(clean) - 1) {
+        if (*s == '%' && isxdigit((int)*(s + 1)) && isxdigit((int)*(s + 2))) {
+            char hex[3] = { *(s + 1), *(s + 2), '\0' };
+            clean[d++] = (char)strtol(hex, NULL, 16);
+            s += 3;
+        } else if (*s == ' ' || *s == '"' || *s == '\'') {
+            s++;
+        } else {
+            clean[d++] = *s++;
+        }
+    }
+    clean[d] = '\0';
+
     int mac[6];
-    if (sscanf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
-               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+    if (sscanf(clean, "%02x:%02x:%02x:%02x:%02x:%02x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6 ||
+        sscanf(clean, "%02x-%02x-%02x-%02x-%02x-%02x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6 ||
+        sscanf(clean, "%02x%02x%02x%02x%02x%02x",       &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
         esp_bd_addr_t bda;
         for (int i = 0; i < 6; i++) {
             bda[i] = (uint8_t)mac[i];
         }
         return bt_manager_connect(bda);
     }
+
+    ESP_LOGE(TAG, "Cannot parse MAC address string: '%s' (cleaned: '%s')", mac_str, clean);
     return ESP_ERR_INVALID_ARG;
 }
 
