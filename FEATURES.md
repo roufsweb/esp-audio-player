@@ -9,25 +9,26 @@ This document is the authoritative list of planned features, driver capabilities
 ### Supported Audio Formats
 | Format | Decoder | Sample Rates | Bit Depth | Notes |
 |:-------|:--------|:-------------|:----------|:------|
-| WAV (PCM) | Native parser | 44.1 kHz | 16-bit, 24-bit | 24-bit dithered to 16-bit before SBC |
-| MP3 | Helix fixed-point | 44.1 kHz | 16-bit | 48 kHz files refused (pitch wrong without SRC) |
-| FLAC | dr_flac single-header | 44.1 kHz | 16-bit, 24-bit | 24-bit dithered to 16-bit before SBC |
-| AAC (.m4a / .aac) | Helix AAC | 44.1 kHz | 16-bit | Must integrate libhelix-aac separately |
+| WAV (PCM) | Native parser | 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz, 192 kHz | 16-bit, 24-bit | Adaptive real-time SRC downsamples to sink target |
+| MP3 | Helix fixed-point | 44.1 kHz, 48 kHz | 16-bit | Bit-perfect playback on matched sink rate |
+| FLAC | dr_flac single-header | 44.1 kHz, 48 kHz, 88.2 kHz, 96 kHz, 192 kHz | 16-bit, 24-bit | Fast linear interpolation resampler; zero drift |
+| AAC (.m4a / .aac) | Helix AAC | 44.1 kHz, 48 kHz | 16-bit | Must integrate libhelix-aac separately |
 
-**44.1 kHz is the only supported sample rate in Phase 3 v1.** 48 kHz support requires a polyphase SRC stage (Phase 3 v2).
+**Multi-Rate Engine & Adaptive Sample Rate Conversion (SRC)**:
+- High-resolution streams (88.2k, 96k, 176.4k, 192k) are dynamically downsampled to the highest rate negotiated during the Bluetooth handshake (44.1 kHz or 48.0 kHz) using rational-block linear interpolation running on Core 1 with integer arithmetic and sub-microsecond overhead.
+- Native 44.1 kHz and 48.0 kHz streams are passed directly (bit-perfect) without resampling when matched to the sink's configuration.
 
-### Bluetooth Audio Transmission
-- **Protocol:** Bluetooth Classic A2DP Source (BR/EDR)
-- **Codec:** SBC XQ (patched Bluedroid `bta_av_co.c`)
-  - Channel mode: Dual Channel (forced)
-  - Block length: 16 blocks
-  - Subbands: 8
-  - Maximum offered bitpool: 250
-  - **Effective transmitted bitpool:** `min(250, sink_max_bitpool)` negotiated at connect time
-  - **Typical effective range:** 53 (standard sink) to 127 (SBC XQ compatible sink)
-  - Bitrate at bitpool 53, Dual Channel: approximately 395 kbps
-  - Bitrate at bitpool 127: approximately 790 kbps
-- The Bluetooth Classic ACL link has a practical A2DP streaming ceiling of approximately 800 kbps.
+### Bluetooth Audio Transmission: Multi-Bitrate & Handshake Capability Proving
+- **Protocol:** Bluetooth Classic A2DP Source (BR/EDR, AVDTP v1.3)
+- **Handshake Capability Proving ("Probe the Absolute Best the Device Supports")**:
+  - During the AVDTP `AVDTP_DISCOVER` and `AVDTP_GET_CAPABILITIES` exchange upon connection, the Source probes the remote Sink's Service Capabilities to prove the highest supported parameters:
+    1. **Sampling Rate Arbitration**: Probes whether the sink supports 48.0 kHz or 44.1 kHz. If 48.0 kHz is supported, it is offered as the primary high-fidelity tier.
+    2. **Channel Mode Negotiation**: Evaluates support for Dual Channel (SBC XQ mode) vs Joint Stereo vs Stereo.
+    3. **Bitpool Range Probing**: Reads the Sink's advertised `min_bitpool` and `max_bitpool` limits:
+       - **Tier 1 (SBC XQ Ultra-High Bitrate)**: If sink supports Dual Channel with bitpool $\ge 127$, configures bitpool to 127–250 (up to ~790–900 kbps, reaching the physical ACL link throughput ceiling).
+       - **Tier 2 (High-Bitpool SBC)**: If sink advertises a raised bitpool cap (e.g., bitpool 64, 76, or 96 in Joint Stereo), configures bitpool up to 76 (~450–510 kbps) for CD+ transparency.
+       - **Tier 3 (Standard SBC High-Quality)**: Standard consumer sinks capping at bitpool 53 (328 kbps Joint Stereo, 16 blocks, 8 subbands, Loudness allocation).
+- **Transport Link Ceiling:** Physical Bluetooth Classic ACL link provides a practical streaming ceiling of ~800–900 kbps with standard DH5 packets.
 
 ### Playback Controls (Phase 1-3: UART REPL only)
 - `play_file <path>` - Load and play a file from SDMMC

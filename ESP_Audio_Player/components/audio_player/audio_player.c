@@ -77,11 +77,8 @@ static uint32_t s_flac_played_bytes = 0;
 static double s_sine_phase = 0.0;
 static double s_sine_freq = DEFAULT_TONE_FREQ;
 
-/* File I/O DMA buffer for high-speed multi-block SDMMC reads */
-static char *s_file_vbuf = NULL;
-
 /* Linear interpolation resampler for high-res FLAC/WAV (48k, 88.2k, 96k, 192k -> 44.1k) */
-#define RESAMPLE_IN_MAX_FRAMES 2560
+#define RESAMPLE_IN_MAX_FRAMES 1280
 static int16_t *s_resample_in = NULL;
 
 /* PSRAM allocation callbacks for dr_flac to protect internal SRAM */
@@ -127,10 +124,6 @@ static void close_active_file(void)
     if (s_flac != NULL) {
         drflac_close(s_flac);
         s_flac = NULL;
-    }
-    if (s_file_vbuf != NULL) {
-        free(s_file_vbuf);
-        s_file_vbuf = NULL;
     }
 }
 
@@ -695,9 +688,12 @@ esp_err_t audio_player_init(void)
         }
     }
 
-    /* Allocate resampler buffer (in PSRAM) for high-res downsampling */
+    /* Allocate resampler buffer (5,120 bytes) in internal SRAM for speed */
     if (s_resample_in == NULL) {
-        s_resample_in = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_resample_in = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_resample_in) {
+            s_resample_in = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
         if (!s_resample_in) {
             s_resample_in = (int16_t *)malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2);
         }
@@ -706,13 +702,13 @@ esp_err_t audio_player_init(void)
     ring_flush();
 
     /* Pin decode task to Core 1 at priority 5.
-     * 8 KB stack provides plenty of headroom for dr_flac (< 1.5 KB stack usage)
+     * 16 KB stack provides safe headroom for dr_flac LPC synthesis on 24-bit files
      * while preserving critical internal DRAM needed for Bluetooth and Wi-Fi. */
     if (s_decode_task == NULL) {
         BaseType_t ret = xTaskCreatePinnedToCore(
             audio_decode_task,
             "audio_decode",
-            8192,               /* 8 KB stack: ample headroom for dr_flac while protecting DRAM */
+            16384,              /* 16 KB stack: safe headroom for dr_flac frame parsing */
             NULL,
             5,                  /* Priority 5: above idle, cooperates with system */
             &s_decode_task,
@@ -722,7 +718,7 @@ esp_err_t audio_player_init(void)
             ESP_LOGE(TAG, "Failed to create audio decode task on Core 1");
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "Decode task created with 8 KB stack on Core 1");
+        ESP_LOGI(TAG, "Decode task created with 16 KB stack on Core 1");
     }
 
     s_state = AUDIO_STATE_STOPPED;
@@ -830,24 +826,9 @@ esp_err_t audio_player_play_file(const char *path)
     }
 
     if (is_flac) {
-        FILE *f = fopen(path, "rb");
-        if (!f) {
-            ESP_LOGE(TAG, "Cannot open FLAC file '%s'", path);
-            xSemaphoreGive(s_lock);
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        /* 16 KB DMA buffer in internal SRAM: unleashes full hardware multi-block SDMMC DMA (CMD18) */
-        s_file_vbuf = (char *)heap_caps_malloc(16384, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_file_vbuf) {
-            setvbuf(f, s_file_vbuf, _IOFBF, 16384);
-        }
-
-        drflac *flac = drflac_open(drflac__on_read_stdio, drflac__on_seek_stdio, drflac__on_tell_stdio, (void*)f, &s_flac_alloc);
+        drflac *flac = drflac_open_file(path, &s_flac_alloc);
         if (!flac) {
             ESP_LOGE(TAG, "Cannot decode FLAC file '%s'", path);
-            fclose(f);
-            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return ESP_ERR_INVALID_ARG;
         }
@@ -855,7 +836,6 @@ esp_err_t audio_player_play_file(const char *path)
         if (flac->channels > 2 || flac->channels == 0) {
             ESP_LOGE(TAG, "Unsupported FLAC channels (%u). Only Mono and Stereo supported.", flac->channels);
             drflac_close(flac);
-            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return ESP_ERR_NOT_SUPPORTED;
         }
@@ -891,17 +871,11 @@ esp_err_t audio_player_play_file(const char *path)
             return ESP_ERR_NOT_FOUND;
         }
 
-        s_file_vbuf = (char *)heap_caps_malloc(16384, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (s_file_vbuf) {
-            setvbuf(f, s_file_vbuf, _IOFBF, 16384);
-        }
-
         uint32_t data_offset = 0;
         uint32_t data_len = 0;
         esp_err_t err = parse_wav_header(f, &data_offset, &data_len);
         if (err != ESP_OK) {
             fclose(f);
-            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return err;
         }
@@ -933,15 +907,15 @@ esp_err_t audio_player_play_file(const char *path)
     /* Release lock so the Core 1 decode task can immediately begin filling the ring buffer */
     xSemaphoreGive(s_lock);
 
-    /* Signal the dedicated decode task on Core 1 (32 KB stack) to start decoding */
+    /* Signal the dedicated decode task on Core 1 to start decoding */
     notify_decode_task();
 
-    /* Wait briefly (up to 300 ms) for Core 1 decode task to pre-buffer at least ~64 KB of audio (or EOF).
-     * ALL decoding executes safely on Core 1's dedicated 32 KB task stack.
+    /* Wait briefly (up to 300 ms) for Core 1 decode task to pre-buffer at least ~32 KB of audio (or EOF).
+     * ALL decoding executes safely on Core 1's dedicated 16 KB task stack.
      * The caller task (HTTP server / console) consumes ZERO stack for decoding, completely
      * eliminating the stack-overflow reboot panic when clicking Play in the Web UI. */
     for (int i = 0; i < 30; i++) {
-        if (ring_available() >= (64 * 1024) || s_decode_eof) {
+        if (ring_available() >= (32 * 1024) || s_decode_eof) {
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -952,6 +926,7 @@ esp_err_t audio_player_play_file(const char *path)
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
+
 
 esp_err_t audio_player_set_tone(double freq_hz)
 {
