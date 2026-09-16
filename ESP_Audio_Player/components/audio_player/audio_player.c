@@ -77,6 +77,13 @@ static uint32_t s_flac_played_bytes = 0;
 static double s_sine_phase = 0.0;
 static double s_sine_freq = DEFAULT_TONE_FREQ;
 
+/* File I/O DMA buffer for high-speed multi-block SDMMC reads */
+static char *s_file_vbuf = NULL;
+
+/* Linear interpolation resampler for high-res FLAC/WAV (48k, 88.2k, 96k, 192k -> 44.1k) */
+#define RESAMPLE_IN_MAX_FRAMES 2560
+static int16_t *s_resample_in = NULL;
+
 /* PSRAM allocation callbacks for dr_flac to protect internal SRAM */
 static void *flac_malloc(size_t sz, void *pUserData)
 {
@@ -120,6 +127,10 @@ static void close_active_file(void)
     if (s_flac != NULL) {
         drflac_close(s_flac);
         s_flac = NULL;
+    }
+    if (s_file_vbuf != NULL) {
+        free(s_file_vbuf);
+        s_file_vbuf = NULL;
     }
 }
 
@@ -363,72 +374,202 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
     }
 
     if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
-        if (s_flac_channels == 2) {
-            drflac_uint64 frames_needed = max_bytes / 4;
-            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)out_buf);
-            uint32_t bytes_read = (uint32_t)(frames_read * 4);
-            s_flac_played_bytes += bytes_read;
+        if (s_flac_sample_rate == DEFAULT_SAMPLE_RATE) {
+            /* Native 44.1 kHz FLAC */
+            if (s_flac_channels == 2) {
+                drflac_uint64 frames_needed = max_bytes / 4;
+                drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)out_buf);
+                uint32_t bytes_read = (uint32_t)(frames_read * 4);
+                s_flac_played_bytes += bytes_read;
 
-            if (frames_read < frames_needed) {
-                ESP_LOGI(TAG, "FLAC decode reached end of file (%lu / %lu bytes)",
-                         (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
+                if (frames_read < frames_needed) {
+                    ESP_LOGI(TAG, "FLAC decode reached end of file (%lu / %lu bytes)",
+                             (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+                return bytes_read;
+            } else if (s_flac_channels == 1) {
+                uint32_t frames_needed = max_bytes / 4;
+                if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
+
+                drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)s_mono_tmp);
+                s_flac_played_bytes += (uint32_t)(frames_read * 2);
+
+                int16_t *stereo = (int16_t *)out_buf;
+                for (uint32_t i = 0; i < (uint32_t)frames_read; i++) {
+                    stereo[i * 2]     = s_mono_tmp[i];
+                    stereo[i * 2 + 1] = s_mono_tmp[i];
+                }
+
+                if (frames_read < (drflac_uint64)frames_needed) {
+                    ESP_LOGI(TAG, "Mono FLAC decode reached end of file");
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+                return (uint32_t)(frames_read * 4);
+            }
+        } else {
+            /* High-Res FLAC (48k, 88.2k, 96k, 192k): Real-time linear interpolation downsampler to 44.1 kHz */
+            if (!s_resample_in) return 0;
+
+            uint32_t target_out_frames = 588; /* 588 frames * 4 = 2352 bytes: exact integer ratio for 48k, 88.2k, 96k, 192k */
+            if (target_out_frames * 4 > max_bytes) {
+                target_out_frames = max_bytes / 4;
+            }
+
+            uint32_t in_frames_needed = ((uint64_t)target_out_frames * s_flac_sample_rate) / DEFAULT_SAMPLE_RATE;
+            if (in_frames_needed > RESAMPLE_IN_MAX_FRAMES) {
+                in_frames_needed = RESAMPLE_IN_MAX_FRAMES;
+                target_out_frames = ((uint64_t)in_frames_needed * DEFAULT_SAMPLE_RATE) / s_flac_sample_rate;
+            }
+
+            drflac_uint64 in_frames_read = 0;
+            if (s_flac_channels == 2) {
+                in_frames_read = drflac_read_pcm_frames_s16(s_flac, in_frames_needed, (drflac_int16 *)s_resample_in);
+                s_flac_played_bytes += (uint32_t)(in_frames_read * 4);
+            } else if (s_flac_channels == 1) {
+                drflac_uint64 mono_read = drflac_read_pcm_frames_s16(s_flac, in_frames_needed, (drflac_int16 *)s_mono_tmp);
+                s_flac_played_bytes += (uint32_t)(mono_read * 2);
+                in_frames_read = mono_read;
+                for (uint32_t i = 0; i < (uint32_t)mono_read; i++) {
+                    s_resample_in[i * 2]     = s_mono_tmp[i];
+                    s_resample_in[i * 2 + 1] = s_mono_tmp[i];
+                }
+            }
+
+            if (in_frames_read == 0) {
+                s_decode_eof = true;
+                close_active_file();
+                return 0;
+            }
+
+            uint32_t out_frames = target_out_frames;
+            if (in_frames_read < in_frames_needed) {
+                out_frames = ((uint64_t)in_frames_read * DEFAULT_SAMPLE_RATE) / s_flac_sample_rate;
                 s_decode_eof = true;
                 close_active_file();
             }
-            return bytes_read;
-        } else if (s_flac_channels == 1) {
-            uint32_t frames_needed = max_bytes / 4;
-            if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
 
-            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)s_mono_tmp);
-            s_flac_played_bytes += (uint32_t)(frames_read * 2);
+            if (out_frames == 0) return 0;
 
-            int16_t *stereo = (int16_t *)out_buf;
-            for (uint32_t i = 0; i < (uint32_t)frames_read; i++) {
-                stereo[i * 2]     = s_mono_tmp[i];
-                stereo[i * 2 + 1] = s_mono_tmp[i];
+            int16_t *out = (int16_t *)out_buf;
+            uint64_t step = ((uint64_t)in_frames_read << 16) / out_frames;
+            uint64_t pos = 0;
+            for (uint32_t i = 0; i < out_frames; i++) {
+                uint32_t idx = (uint32_t)(pos >> 16);
+                uint32_t frac = (uint32_t)(pos & 0xFFFF);
+                uint32_t next_idx = (idx + 1 < (uint32_t)in_frames_read) ? idx + 1 : idx;
+
+                int32_t l0 = s_resample_in[idx * 2];
+                int32_t l1 = s_resample_in[next_idx * 2];
+                int32_t r0 = s_resample_in[idx * 2 + 1];
+                int32_t r1 = s_resample_in[next_idx * 2 + 1];
+
+                out[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
+                out[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
+                pos += step;
             }
-
-            if (frames_read < (drflac_uint64)frames_needed) {
-                ESP_LOGI(TAG, "Mono FLAC decode reached end of file");
-                s_decode_eof = true;
-                close_active_file();
-            }
-            return (uint32_t)(frames_read * 4);
+            return out_frames * 4;
         }
     } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
-        if (s_wav_channels == 2) {
-            size_t bytes_read = fread(out_buf, 1, max_bytes, s_wav_file);
-            s_wav_played_bytes += bytes_read;
+        if (s_wav_sample_rate == DEFAULT_SAMPLE_RATE) {
+            if (s_wav_channels == 2) {
+                size_t bytes_read = fread(out_buf, 1, max_bytes, s_wav_file);
+                s_wav_played_bytes += bytes_read;
 
-            if (bytes_read < max_bytes) {
-                ESP_LOGI(TAG, "WAV decode reached end of file (%lu / %lu bytes)",
-                         (unsigned long)s_wav_played_bytes, (unsigned long)s_wav_total_bytes);
+                if (bytes_read < max_bytes) {
+                    ESP_LOGI(TAG, "WAV decode reached end of file (%lu / %lu bytes)",
+                             (unsigned long)s_wav_played_bytes, (unsigned long)s_wav_total_bytes);
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+                return (uint32_t)bytes_read;
+            } else if (s_wav_channels == 1) {
+                uint32_t frames_needed = max_bytes / 4;
+                if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
+                size_t mono_bytes = frames_needed * 2;
+
+                size_t bytes_read = fread(s_mono_tmp, 1, mono_bytes, s_wav_file);
+                s_wav_played_bytes += bytes_read;
+
+                uint32_t samples_read = bytes_read / 2;
+                int16_t *stereo = (int16_t *)out_buf;
+                for (uint32_t i = 0; i < samples_read; i++) {
+                    stereo[i * 2]     = s_mono_tmp[i];
+                    stereo[i * 2 + 1] = s_mono_tmp[i];
+                }
+
+                if (bytes_read < mono_bytes) {
+                    ESP_LOGI(TAG, "Mono WAV decode reached end of file");
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+                return samples_read * 4;
+            }
+        } else {
+            /* High-Res WAV Resampler */
+            if (!s_resample_in) return 0;
+            uint32_t target_out_frames = 588;
+            if (target_out_frames * 4 > max_bytes) target_out_frames = max_bytes / 4;
+
+            uint32_t in_frames_needed = ((uint64_t)target_out_frames * s_wav_sample_rate) / DEFAULT_SAMPLE_RATE;
+            if (in_frames_needed > RESAMPLE_IN_MAX_FRAMES) {
+                in_frames_needed = RESAMPLE_IN_MAX_FRAMES;
+                target_out_frames = ((uint64_t)in_frames_needed * DEFAULT_SAMPLE_RATE) / s_wav_sample_rate;
+            }
+
+            size_t bytes_to_read = in_frames_needed * s_wav_channels * 2;
+            size_t in_bytes_read = 0;
+            uint32_t in_frames_read = 0;
+
+            if (s_wav_channels == 2) {
+                in_bytes_read = fread(s_resample_in, 1, bytes_to_read, s_wav_file);
+                in_frames_read = in_bytes_read / 4;
+                s_wav_played_bytes += in_bytes_read;
+            } else if (s_wav_channels == 1) {
+                in_bytes_read = fread(s_mono_tmp, 1, in_frames_needed * 2, s_wav_file);
+                in_frames_read = in_bytes_read / 2;
+                s_wav_played_bytes += in_bytes_read;
+                for (uint32_t i = 0; i < in_frames_read; i++) {
+                    s_resample_in[i * 2]     = s_mono_tmp[i];
+                    s_resample_in[i * 2 + 1] = s_mono_tmp[i];
+                }
+            }
+
+            if (in_frames_read == 0) {
+                s_decode_eof = true;
+                close_active_file();
+                return 0;
+            }
+
+            uint32_t out_frames = target_out_frames;
+            if (in_frames_read < in_frames_needed) {
+                out_frames = ((uint64_t)in_frames_read * DEFAULT_SAMPLE_RATE) / s_wav_sample_rate;
                 s_decode_eof = true;
                 close_active_file();
             }
-            return (uint32_t)bytes_read;
-        } else if (s_wav_channels == 1) {
-            uint32_t frames_needed = max_bytes / 4;
-            if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
-            size_t mono_bytes = frames_needed * 2;
 
-            size_t bytes_read = fread(s_mono_tmp, 1, mono_bytes, s_wav_file);
-            s_wav_played_bytes += bytes_read;
+            if (out_frames == 0) return 0;
 
-            uint32_t samples_read = bytes_read / 2;
-            int16_t *stereo = (int16_t *)out_buf;
-            for (uint32_t i = 0; i < samples_read; i++) {
-                stereo[i * 2]     = s_mono_tmp[i];
-                stereo[i * 2 + 1] = s_mono_tmp[i];
+            int16_t *out = (int16_t *)out_buf;
+            uint64_t step = ((uint64_t)in_frames_read << 16) / out_frames;
+            uint64_t pos = 0;
+            for (uint32_t i = 0; i < out_frames; i++) {
+                uint32_t idx = (uint32_t)(pos >> 16);
+                uint32_t frac = (uint32_t)(pos & 0xFFFF);
+                uint32_t next_idx = (idx + 1 < in_frames_read) ? idx + 1 : idx;
+
+                int32_t l0 = s_resample_in[idx * 2];
+                int32_t l1 = s_resample_in[next_idx * 2];
+                int32_t r0 = s_resample_in[idx * 2 + 1];
+                int32_t r1 = s_resample_in[next_idx * 2 + 1];
+
+                out[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
+                out[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
+                pos += step;
             }
-
-            if (bytes_read < mono_bytes) {
-                ESP_LOGI(TAG, "Mono WAV decode reached end of file");
-                s_decode_eof = true;
-                close_active_file();
-            }
-            return samples_read * 4;
+            return out_frames * 4;
         }
     }
 
@@ -487,13 +628,19 @@ static void audio_decode_task(void *arg)
 
             ring_write(chunk, decoded);
 
-            /* Yield 1 tick (10 ms) every 4 chunks (~16 KB = ~93 ms audio) to feed Core 1 Task Watchdog.
-             * CONFIG_FREERTOS_HZ is 100 Hz, so pdMS_TO_TICKS(2) evaluated to 0 ticks (no-op).
-             * Yielding 1 tick every 4 chunks produces ~93 ms of audio every ~13 ms (7x real-time),
-             * while allowing the Core 1 IDLE task to regularly feed the watchdog. */
+            /* Dynamic yield to feed Core 1 Task Watchdog:
+             * When buffer is low (< 256 KB), decode fast (yield every 16 chunks = ~64 KB).
+             * When buffer is healthy (>= 256 KB), yield every 4 chunks. */
             static uint32_t s_chunk_count = 0;
-            if ((++s_chunk_count & 3) == 0) {
-                vTaskDelay(1);
+            s_chunk_count++;
+            if (filled < PCM_REFILL_THRESH) {
+                if ((s_chunk_count & 15) == 0) {
+                    vTaskDelay(1);
+                }
+            } else {
+                if ((s_chunk_count & 3) == 0) {
+                    vTaskDelay(1);
+                }
             }
         }
     }
@@ -545,6 +692,14 @@ esp_err_t audio_player_init(void)
         s_mono_tmp = (int16_t *)heap_caps_malloc(PCM_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_mono_tmp) {
             s_mono_tmp = (int16_t *)malloc(PCM_CHUNK_FRAMES * sizeof(int16_t));
+        }
+    }
+
+    /* Allocate resampler buffer (in PSRAM) for high-res downsampling */
+    if (s_resample_in == NULL) {
+        s_resample_in = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_resample_in) {
+            s_resample_in = (int16_t *)malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t) * 2);
         }
     }
 
@@ -675,9 +830,24 @@ esp_err_t audio_player_play_file(const char *path)
     }
 
     if (is_flac) {
-        drflac *flac = drflac_open_file(path, &s_flac_alloc);
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            ESP_LOGE(TAG, "Cannot open FLAC file '%s'", path);
+            xSemaphoreGive(s_lock);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        /* 16 KB DMA buffer in internal SRAM: unleashes full hardware multi-block SDMMC DMA (CMD18) */
+        s_file_vbuf = (char *)heap_caps_malloc(16384, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_file_vbuf) {
+            setvbuf(f, s_file_vbuf, _IOFBF, 16384);
+        }
+
+        drflac *flac = drflac_open(drflac__on_read_stdio, drflac__on_seek_stdio, drflac__on_tell_stdio, (void*)f, &s_flac_alloc);
         if (!flac) {
             ESP_LOGE(TAG, "Cannot decode FLAC file '%s'", path);
+            fclose(f);
+            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return ESP_ERR_INVALID_ARG;
         }
@@ -685,6 +855,7 @@ esp_err_t audio_player_play_file(const char *path)
         if (flac->channels > 2 || flac->channels == 0) {
             ESP_LOGE(TAG, "Unsupported FLAC channels (%u). Only Mono and Stereo supported.", flac->channels);
             drflac_close(flac);
+            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return ESP_ERR_NOT_SUPPORTED;
         }
@@ -708,8 +879,8 @@ esp_err_t audio_player_play_file(const char *path)
                  s_flac_channels == 2 ? "Stereo" : "Mono",
                  duration_sec, (unsigned long long)flac->totalPCMFrameCount);
 
-        if (s_flac_sample_rate != 44100) {
-            ESP_LOGW(TAG, "FLAC sample rate is %lu Hz. Target is 44100 Hz. Pitch may be shifted without SRC.", (unsigned long)s_flac_sample_rate);
+        if (s_flac_sample_rate != DEFAULT_SAMPLE_RATE) {
+            ESP_LOGI(TAG, "High-Res audio: Real-time linear resampler active (%lu Hz -> 44100 Hz)", (unsigned long)s_flac_sample_rate);
         }
     } else {
         /* Process WAV file container */
@@ -720,11 +891,17 @@ esp_err_t audio_player_play_file(const char *path)
             return ESP_ERR_NOT_FOUND;
         }
 
+        s_file_vbuf = (char *)heap_caps_malloc(16384, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (s_file_vbuf) {
+            setvbuf(f, s_file_vbuf, _IOFBF, 16384);
+        }
+
         uint32_t data_offset = 0;
         uint32_t data_len = 0;
         esp_err_t err = parse_wav_header(f, &data_offset, &data_len);
         if (err != ESP_OK) {
             fclose(f);
+            if (s_file_vbuf) { free(s_file_vbuf); s_file_vbuf = NULL; }
             xSemaphoreGive(s_lock);
             return err;
         }
@@ -747,6 +924,10 @@ esp_err_t audio_player_play_file(const char *path)
                  (unsigned long)s_wav_sample_rate, s_wav_bit_depth,
                  s_wav_channels == 2 ? "Stereo" : "Mono",
                  duration_sec, (unsigned long)(data_len / 1024));
+
+        if (s_wav_sample_rate != DEFAULT_SAMPLE_RATE) {
+            ESP_LOGI(TAG, "High-Res audio: Real-time linear resampler active (%lu Hz -> 44100 Hz)", (unsigned long)s_wav_sample_rate);
+        }
     }
 
     /* Release lock so the Core 1 decode task can immediately begin filling the ring buffer */
