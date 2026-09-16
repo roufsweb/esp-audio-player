@@ -17,7 +17,8 @@ typedef enum {
 typedef enum {
     AUDIO_SOURCE_NONE,
     AUDIO_SOURCE_SINE,
-    AUDIO_SOURCE_WAV
+    AUDIO_SOURCE_WAV,
+    AUDIO_SOURCE_FLAC
 } audio_player_source_t;
 
 typedef struct {

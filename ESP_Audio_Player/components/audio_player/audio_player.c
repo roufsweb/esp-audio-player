@@ -9,6 +9,12 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_console.h"
+#include "esp_heap_caps.h"
+#include <ctype.h>
+
+#define DR_FLAC_IMPLEMENTATION
+#define DR_FLAC_NO_OGG
+#include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";
 
@@ -20,6 +26,87 @@ static audio_player_state_t s_state = AUDIO_STATE_STOPPED;
 static audio_player_source_t s_source = AUDIO_SOURCE_SINE;
 static audio_player_media_ctrl_cb_t s_media_ctrl_cb = NULL;
 static uint8_t s_volume = 100;
+
+/* Active audio path */
+static char s_audio_path[256] = {0};
+
+/* WAV file playback state */
+static FILE *s_wav_file = NULL;
+static uint32_t s_wav_sample_rate = DEFAULT_SAMPLE_RATE;
+static uint16_t s_wav_channels = 2;
+static uint16_t s_wav_bit_depth = 16;
+static uint32_t s_wav_data_offset = 0;
+static uint32_t s_wav_total_bytes = 0;
+static uint32_t s_wav_played_bytes = 0;
+
+/* FLAC file playback state */
+static drflac *s_flac = NULL;
+static uint32_t s_flac_sample_rate = DEFAULT_SAMPLE_RATE;
+static uint16_t s_flac_channels = 2;
+static uint16_t s_flac_bit_depth = 16;
+static uint32_t s_flac_total_bytes = 0;
+static uint32_t s_flac_played_bytes = 0;
+
+/* PSRAM allocation callbacks for dr_flac to protect internal SRAM */
+static void *flac_malloc(size_t sz, void *pUserData)
+{
+    (void)pUserData;
+    void *ptr = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = malloc(sz);
+    }
+    return ptr;
+}
+
+static void *flac_realloc(void *p, size_t sz, void *pUserData)
+{
+    (void)pUserData;
+    void *ptr = heap_caps_realloc(p, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = realloc(p, sz);
+    }
+    return ptr;
+}
+
+static void flac_free(void *p, void *pUserData)
+{
+    (void)pUserData;
+    free(p);
+}
+
+static drflac_allocation_callbacks s_flac_alloc = {
+    .pUserData = NULL,
+    .onMalloc = flac_malloc,
+    .onRealloc = flac_realloc,
+    .onFree = flac_free,
+};
+
+static void close_active_file(void)
+{
+    if (s_wav_file != NULL) {
+        fclose(s_wav_file);
+        s_wav_file = NULL;
+    }
+    if (s_flac != NULL) {
+        drflac_close(s_flac);
+        s_flac = NULL;
+    }
+}
+
+static bool has_extension(const char *path, const char *ext)
+{
+    if (!path || !ext) return false;
+    size_t plen = strlen(path);
+    size_t elen = strlen(ext);
+    if (plen < elen) return false;
+    const char *p = path + plen - elen;
+    while (*p && *ext) {
+        if (tolower((int)*p) != tolower((int)*ext)) return false;
+        p++;
+        ext++;
+    }
+    return true;
+}
 
 void audio_player_set_media_ctrl_cb(audio_player_media_ctrl_cb_t cb)
 {
@@ -41,16 +128,6 @@ uint8_t audio_player_get_volume(void)
 /* Sine wave state */
 static double s_sine_phase = 0.0;
 static double s_sine_freq = DEFAULT_TONE_FREQ;
-
-/* WAV file playback state */
-static FILE *s_wav_file = NULL;
-static char s_wav_path[256] = {0};
-static uint32_t s_wav_sample_rate = DEFAULT_SAMPLE_RATE;
-static uint16_t s_wav_channels = 2;
-static uint16_t s_wav_bit_depth = 16;
-static uint32_t s_wav_data_offset = 0;
-static uint32_t s_wav_total_bytes = 0;
-static uint32_t s_wav_played_bytes = 0;
 
 /* Helper to parse WAV RIFF chunks */
 static esp_err_t parse_wav_header(FILE *f, uint32_t *out_data_offset, uint32_t *out_data_len)
@@ -212,6 +289,43 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
                 s_state = AUDIO_STATE_STOPPED;
             }
         }
+    } else if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
+        if (s_flac_channels == 2) {
+            drflac_uint64 frames_needed = len / 4;
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)data);
+            size_t bytes_read = (size_t)(frames_read * 4);
+            s_flac_played_bytes += bytes_read;
+
+            if (frames_read < frames_needed) {
+                memset(data + bytes_read, 0, len - bytes_read);
+                ESP_LOGI(TAG, "FLAC playback reached end of file (%lu / %lu bytes)",
+                         (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
+                drflac_close(s_flac);
+                s_flac = NULL;
+                s_state = AUDIO_STATE_STOPPED;
+            }
+        } else if (s_flac_channels == 1) {
+            /* Mono 16-bit FLAC: read half into second half of buffer, then duplicate to stereo */
+            int mono_samples = len / 4;
+            int16_t *mono_buf = (int16_t *)(data + (len / 2));
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, mono_samples, (drflac_int16 *)mono_buf);
+            s_flac_played_bytes += (size_t)(frames_read * 2);
+
+            int16_t *stereo_out = (int16_t *)data;
+            for (int i = 0; i < (int)frames_read; i++) {
+                int16_t s = mono_buf[i];
+                stereo_out[i * 2]     = s;
+                stereo_out[i * 2 + 1] = s;
+            }
+            if (frames_read < (drflac_uint64)mono_samples) {
+                int remaining_samples = mono_samples - (int)frames_read;
+                memset(&stereo_out[frames_read * 2], 0, remaining_samples * 4);
+                ESP_LOGI(TAG, "Mono FLAC playback reached end of file");
+                drflac_close(s_flac);
+                s_flac = NULL;
+                s_state = AUDIO_STATE_STOPPED;
+            }
+        }
     } else if (s_source == AUDIO_SOURCE_SINE) {
         int16_t *pcm = (int16_t *)data;
         int samples = len / 4;
@@ -254,11 +368,67 @@ esp_err_t audio_player_play_file(const char *path)
     }
 
     /* Close previously open file */
-    if (s_wav_file != NULL) {
-        fclose(s_wav_file);
-        s_wav_file = NULL;
+    close_active_file();
+
+    /* Container auto-detection: check extension or magic bytes */
+    bool is_flac = has_extension(path, ".flac");
+    bool is_wav = has_extension(path, ".wav");
+
+    if (!is_flac && !is_wav) {
+        FILE *probe = fopen(path, "rb");
+        if (probe) {
+            char magic[4] = {0};
+            if (fread(magic, 1, 4, probe) == 4) {
+                if (strncmp(magic, "fLaC", 4) == 0) is_flac = true;
+                else if (strncmp(magic, "RIFF", 4) == 0) is_wav = true;
+            }
+            fclose(probe);
+        }
     }
 
+    if (is_flac) {
+        drflac *flac = drflac_open_file(path, &s_flac_alloc);
+        if (!flac) {
+            ESP_LOGE(TAG, "Cannot decode FLAC file '%s'", path);
+            xSemaphoreGive(s_lock);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        if (flac->channels > 2 || flac->channels == 0) {
+            ESP_LOGE(TAG, "Unsupported FLAC channels (%u). Only Mono and Stereo supported.", flac->channels);
+            drflac_close(flac);
+            xSemaphoreGive(s_lock);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        s_flac = flac;
+        s_flac_sample_rate = flac->sampleRate;
+        s_flac_channels = flac->channels;
+        s_flac_bit_depth = flac->bitsPerSample;
+        s_flac_total_bytes = (uint32_t)(flac->totalPCMFrameCount * flac->channels * 2);
+        s_flac_played_bytes = 0;
+
+        strncpy(s_audio_path, path, sizeof(s_audio_path) - 1);
+        s_source = AUDIO_SOURCE_FLAC;
+        s_state = AUDIO_STATE_PLAYING;
+
+        double duration_sec = flac->sampleRate > 0 ? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
+        ESP_LOGI(TAG, "Playing FLAC: '%s'", path);
+        ESP_LOGI(TAG, "Format: %lu Hz, %u-bit, %s (Duration: %.2f sec, Frames: %llu)",
+                 (unsigned long)s_flac_sample_rate, s_flac_bit_depth,
+                 s_flac_channels == 2 ? "Stereo" : "Mono",
+                 duration_sec, (unsigned long long)flac->totalPCMFrameCount);
+
+        if (s_flac_sample_rate != 44100) {
+            ESP_LOGW(TAG, "FLAC sample rate is %lu Hz. Target is 44100 Hz. Pitch may be shifted without SRC.", (unsigned long)s_flac_sample_rate);
+        }
+
+        xSemaphoreGive(s_lock);
+        if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
+        return ESP_OK;
+    }
+
+    /* Process WAV file container */
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGE(TAG, "Cannot open audio file '%s'", path);
@@ -278,7 +448,7 @@ esp_err_t audio_player_play_file(const char *path)
     fseek(f, data_offset, SEEK_SET);
 
     s_wav_file = f;
-    strncpy(s_wav_path, path, sizeof(s_wav_path) - 1);
+    strncpy(s_audio_path, path, sizeof(s_audio_path) - 1);
     s_wav_data_offset = data_offset;
     s_wav_total_bytes = data_len;
     s_wav_played_bytes = 0;
@@ -308,10 +478,7 @@ esp_err_t audio_player_set_tone(double freq_hz)
         return ESP_ERR_TIMEOUT;
     }
 
-    if (s_wav_file != NULL) {
-        fclose(s_wav_file);
-        s_wav_file = NULL;
-    }
+    close_active_file();
 
     s_sine_freq = freq_hz;
     s_sine_phase = 0.0;
@@ -347,12 +514,10 @@ esp_err_t audio_player_pause(void)
 esp_err_t audio_player_stop(void)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    if (s_wav_file != NULL) {
-        fclose(s_wav_file);
-        s_wav_file = NULL;
-    }
+    close_active_file();
     s_state = AUDIO_STATE_STOPPED;
     s_wav_played_bytes = 0;
+    s_flac_played_bytes = 0;
     ESP_LOGI(TAG, "Audio playback stopped.");
     xSemaphoreGive(s_lock);
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_STOP);
@@ -365,12 +530,20 @@ void audio_player_get_status(audio_player_status_t *out_status)
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
         out_status->state = s_state;
         out_status->source = s_source;
-        strncpy(out_status->current_path, s_wav_path, sizeof(out_status->current_path));
-        out_status->sample_rate = s_wav_sample_rate;
-        out_status->channels = s_wav_channels;
-        out_status->bit_depth = s_wav_bit_depth;
-        out_status->total_audio_bytes = s_wav_total_bytes;
-        out_status->played_audio_bytes = s_wav_played_bytes;
+        strncpy(out_status->current_path, s_audio_path, sizeof(out_status->current_path) - 1);
+        if (s_source == AUDIO_SOURCE_FLAC) {
+            out_status->sample_rate = s_flac_sample_rate;
+            out_status->channels = s_flac_channels;
+            out_status->bit_depth = s_flac_bit_depth;
+            out_status->total_audio_bytes = s_flac_total_bytes;
+            out_status->played_audio_bytes = s_flac_played_bytes;
+        } else {
+            out_status->sample_rate = s_wav_sample_rate;
+            out_status->channels = s_wav_channels;
+            out_status->bit_depth = s_wav_bit_depth;
+            out_status->total_audio_bytes = s_wav_total_bytes;
+            out_status->played_audio_bytes = s_wav_played_bytes;
+        }
         xSemaphoreGive(s_lock);
     }
 }
@@ -380,7 +553,7 @@ void audio_player_get_status(audio_player_status_t *out_status)
 static int cmd_play_file(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: play_file <path> (e.g. play_file /sdcard/track1.wav)\n");
+        printf("Usage: play_file <path> (e.g. play_file /sdcard/track1.flac)\n");
         return 1;
     }
     esp_err_t ret = audio_player_play_file(argv[1]);
@@ -436,11 +609,12 @@ static int cmd_status(int argc, char **argv)
     const char *src_str = "NONE";
     if (st.source == AUDIO_SOURCE_SINE) src_str = "SINE_TONE";
     else if (st.source == AUDIO_SOURCE_WAV) src_str = "WAV_FILE";
+    else if (st.source == AUDIO_SOURCE_FLAC) src_str = "FLAC_FILE";
 
     printf("--- Audio Player Status ---\n");
     printf("State:       %s\n", state_str);
     printf("Source:      %s\n", src_str);
-    if (st.source == AUDIO_SOURCE_WAV) {
+    if (st.source == AUDIO_SOURCE_WAV || st.source == AUDIO_SOURCE_FLAC) {
         printf("File:        %s\n", st.current_path);
         printf("Sample Rate: %lu Hz\n", (unsigned long)st.sample_rate);
         printf("Channels:    %u (%s)\n", st.channels, st.channels == 2 ? "Stereo" : "Mono");
@@ -467,7 +641,7 @@ void audio_player_register_console_commands(void)
 {
     esp_console_cmd_t play_file_cmd = {
         .command = "play_file",
-        .help = "Play an uncompressed WAV audio file from SD card",
+        .help = "Play a FLAC or WAV audio file from SD card",
         .hint = "<path>",
         .func = &cmd_play_file,
     };

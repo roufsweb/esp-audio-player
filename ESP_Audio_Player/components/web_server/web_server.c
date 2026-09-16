@@ -247,7 +247,8 @@ static const char s_dashboard_html[] =
 "  document.getElementById('volVal').innerText = val + '%';\n"
 "  fetch('/api/player/volume?vol=' + val, { method: 'POST' });\n"
 "}\n"
-"function playFile(path) {\n"
+"function playFile(encodedName) {\n"
+"  const path = '/sdcard/' + decodeURIComponent(encodedName);\n"
 "  showToast('Playing ' + path.split('/').pop() + '...');\n"
 "  fetch('/api/player/play_file?path=' + encodeURIComponent(path), { method: 'POST' })\n"
 "    .then(r => r.json())\n"
@@ -371,7 +372,7 @@ static const char s_dashboard_html[] =
 "        document.getElementById('audioState').innerText = 'State: ' + p.state;\n"
 "        document.getElementById('audioSource').innerText = 'Source: ' + p.source;\n"
 "        let name = 'Idle';\n"
-"        if (p.source === 'WAV' && p.file) name = p.file.split('/').pop();\n"
+"        if ((p.source === 'WAV' || p.source === 'FLAC') && p.file) name = p.file.split('/').pop();\n"
 "        else if (p.source === 'SINE') name = 'DSP Sine Tone';\n"
 "        document.getElementById('trackName').innerText = name;\n"
 "        document.getElementById('audioFormat').innerText = p.sample_rate + ' Hz / ' + p.bit_depth + '-bit / ' + (p.channels === 2 ? 'Stereo' : 'Mono');\n"
@@ -404,7 +405,8 @@ static const char s_dashboard_html[] =
 "        const icon = f.is_dir ? '&#128193;' : (isAudio ? '&#127925;' : '&#128196;');\n"
 "        let playBtn = '';\n"
 "        if (isAudio) {\n"
-"          playBtn = `<button class=\"btn-primary btn-sm\" onclick=\"playFile('/sdcard/${f.name}')\">&#9654; Play</button>`;\n"
+"          const enc = encodeURIComponent(f.name);\n"
+"          playBtn = `<button class=\"btn-primary btn-sm\" onclick=\"playFile('${enc}')\">&#9654; Play</button>`;\n"
 "        }\n"
 "        item.innerHTML = `\n"
 "          <div class=\"file-meta\">\n"
@@ -463,6 +465,7 @@ static esp_err_t get_status_handler(httpd_req_t *req)
 
     const char *source_str = "NONE";
     if (a_status.source == AUDIO_SOURCE_WAV) source_str = "WAV";
+    else if (a_status.source == AUDIO_SOURCE_FLAC) source_str = "FLAC";
     else if (a_status.source == AUDIO_SOURCE_SINE) source_str = "SINE";
 
     bt_mgr_status_t bt_status;
