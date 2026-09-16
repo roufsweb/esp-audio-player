@@ -4,13 +4,15 @@
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
-#include <ctype.h>
+#include "esp_memory_utils.h"
 
 #define DR_FLAC_IMPLEMENTATION
 #define DR_FLAC_NO_OGG
@@ -21,7 +23,23 @@ static const char *TAG = "AUDIO_PLAYER";
 #define DEFAULT_SAMPLE_RATE 44100
 #define DEFAULT_TONE_FREQ   440.0
 
+#define PCM_RING_BUF_SIZE   (64 * 1024)             /* 64 KB = 16,384 stereo frames (~371ms @ 44.1kHz) */
+#define PCM_REFILL_THRESH   (PCM_RING_BUF_SIZE / 2) /* 32 KB: refill when dropped below 50% */
+#define PCM_HIGH_WATERMARK  (PCM_RING_BUF_SIZE * 3 / 4) /* 48 KB: pause decoder when >= 75% */
+#define PCM_CHUNK_FRAMES    1024
+#define PCM_CHUNK_BYTES     (PCM_CHUNK_FRAMES * 4)  /* 4096 bytes (1024 frames * 2 ch * 2 bytes) */
+
 static SemaphoreHandle_t s_lock = NULL;
+static SemaphoreHandle_t s_ring_lock = NULL;
+static SemaphoreHandle_t s_decode_sem = NULL;
+static TaskHandle_t      s_decode_task = NULL;
+
+static uint8_t          *s_ring_buf = NULL;
+static uint32_t          s_ring_write = 0;
+static uint32_t          s_ring_read = 0;
+static uint32_t          s_ring_filled = 0;
+static volatile bool     s_decode_eof = false;
+
 static audio_player_state_t s_state = AUDIO_STATE_STOPPED;
 static audio_player_source_t s_source = AUDIO_SOURCE_SINE;
 static audio_player_media_ctrl_cb_t s_media_ctrl_cb = NULL;
@@ -46,6 +64,10 @@ static uint16_t s_flac_channels = 2;
 static uint16_t s_flac_bit_depth = 16;
 static uint32_t s_flac_total_bytes = 0;
 static uint32_t s_flac_played_bytes = 0;
+
+/* Sine wave state */
+static double s_sine_phase = 0.0;
+static double s_sine_freq = DEFAULT_TONE_FREQ;
 
 /* PSRAM allocation callbacks for dr_flac to protect internal SRAM */
 static void *flac_malloc(size_t sz, void *pUserData)
@@ -125,9 +147,121 @@ uint8_t audio_player_get_volume(void)
     return s_volume;
 }
 
-/* Sine wave state */
-static double s_sine_phase = 0.0;
-static double s_sine_freq = DEFAULT_TONE_FREQ;
+/* Ring buffer signaling helper */
+static inline void notify_decode_task(void)
+{
+    if (!s_decode_sem) return;
+    if (xPortInIsrContext()) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(s_decode_sem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    } else {
+        xSemaphoreGive(s_decode_sem);
+    }
+}
+
+/* Query bytes buffered in ring buffer */
+static uint32_t ring_available(void)
+{
+    uint32_t filled = 0;
+    if (s_ring_lock && xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
+        filled = s_ring_filled;
+        xSemaphoreGive(s_ring_lock);
+    }
+    return filled;
+}
+
+/* Reset ring buffer pointers and counters */
+static void ring_flush(void)
+{
+    if (s_ring_lock && xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_ring_write = 0;
+        s_ring_read = 0;
+        s_ring_filled = 0;
+        s_decode_eof = false;
+        xSemaphoreGive(s_ring_lock);
+    }
+}
+
+/* Write PCM data into circular ring buffer */
+static uint32_t ring_write(const uint8_t *src, uint32_t len)
+{
+    if (!s_ring_buf || !s_ring_lock || len == 0 || !src) return 0;
+
+    if (xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return 0;
+    }
+
+    uint32_t space = PCM_RING_BUF_SIZE - s_ring_filled;
+    if (len > space) {
+        len = space;
+    }
+    if (len == 0) {
+        xSemaphoreGive(s_ring_lock);
+        return 0;
+    }
+
+    uint32_t first_part = PCM_RING_BUF_SIZE - s_ring_write;
+    if (first_part > len) {
+        first_part = len;
+    }
+    memcpy(s_ring_buf + s_ring_write, src, first_part);
+
+    uint32_t second_part = len - first_part;
+    if (second_part > 0) {
+        memcpy(s_ring_buf, src + first_part, second_part);
+        s_ring_write = second_part;
+    } else {
+        s_ring_write += first_part;
+        if (s_ring_write >= PCM_RING_BUF_SIZE) {
+            s_ring_write = 0;
+        }
+    }
+
+    s_ring_filled += len;
+    xSemaphoreGive(s_ring_lock);
+    return len;
+}
+
+/* Read PCM data from circular ring buffer */
+static uint32_t ring_read(uint8_t *dst, uint32_t len)
+{
+    if (!s_ring_buf || !s_ring_lock || len == 0 || !dst) return 0;
+
+    if (xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return 0;
+    }
+
+    uint32_t avail = s_ring_filled;
+    if (avail > len) {
+        avail = len;
+    }
+    if (avail == 0) {
+        xSemaphoreGive(s_ring_lock);
+        return 0;
+    }
+
+    uint32_t first_part = PCM_RING_BUF_SIZE - s_ring_read;
+    if (first_part > avail) {
+        first_part = avail;
+    }
+    memcpy(dst, s_ring_buf + s_ring_read, first_part);
+
+    uint32_t second_part = avail - first_part;
+    if (second_part > 0) {
+        memcpy(dst + first_part, s_ring_buf, second_part);
+        s_ring_read = second_part;
+    } else {
+        s_ring_read += first_part;
+        if (s_ring_read >= PCM_RING_BUF_SIZE) {
+            s_ring_read = 0;
+        }
+    }
+
+    s_ring_filled -= avail;
+    xSemaphoreGive(s_ring_lock);
+    return avail;
+}
 
 /* Helper to parse WAV RIFF chunks */
 static esp_err_t parse_wav_header(FILE *f, uint32_t *out_data_offset, uint32_t *out_data_len)
@@ -191,7 +325,6 @@ static esp_err_t parse_wav_header(FILE *f, uint32_t *out_data_offset, uint32_t *
             s_wav_bit_depth = bits_per_sample;
             found_fmt = true;
 
-            /* Skip any remaining bytes in fmt chunk if extended */
             int extra = (int)chunk_size - 16;
             if (extra > 0) {
                 fseek(f, extra, SEEK_CUR);
@@ -202,7 +335,6 @@ static esp_err_t parse_wav_header(FILE *f, uint32_t *out_data_offset, uint32_t *
             found_data = true;
             break;
         } else {
-            /* Skip unknown chunk */
             fseek(f, chunk_size, SEEK_CUR);
         }
     }
@@ -215,6 +347,150 @@ static esp_err_t parse_wav_header(FILE *f, uint32_t *out_data_offset, uint32_t *
     return ESP_OK;
 }
 
+/* Decode one chunk into 16-bit 44.1kHz stereo PCM. Caller MUST hold s_lock. */
+static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
+{
+    if (s_state != AUDIO_STATE_PLAYING || s_decode_eof) {
+        return 0;
+    }
+
+    if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
+        if (s_flac_channels == 2) {
+            drflac_uint64 frames_needed = max_bytes / 4;
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)out_buf);
+            uint32_t bytes_read = (uint32_t)(frames_read * 4);
+            s_flac_played_bytes += bytes_read;
+
+            if (frames_read < frames_needed) {
+                ESP_LOGI(TAG, "FLAC decode reached end of file (%lu / %lu bytes)",
+                         (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
+                s_decode_eof = true;
+                drflac_close(s_flac);
+                s_flac = NULL;
+            }
+            return bytes_read;
+        } else if (s_flac_channels == 1) {
+            uint32_t frames_needed = max_bytes / 4;
+            if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
+
+            static int16_t mono_tmp[PCM_CHUNK_FRAMES];
+            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)mono_tmp);
+            s_flac_played_bytes += (uint32_t)(frames_read * 2);
+
+            int16_t *stereo = (int16_t *)out_buf;
+            for (uint32_t i = 0; i < (uint32_t)frames_read; i++) {
+                stereo[i * 2]     = mono_tmp[i];
+                stereo[i * 2 + 1] = mono_tmp[i];
+            }
+
+            if (frames_read < (drflac_uint64)frames_needed) {
+                ESP_LOGI(TAG, "Mono FLAC decode reached end of file");
+                s_decode_eof = true;
+                drflac_close(s_flac);
+                s_flac = NULL;
+            }
+            return (uint32_t)(frames_read * 4);
+        }
+    } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
+        if (s_wav_channels == 2) {
+            size_t bytes_read = fread(out_buf, 1, max_bytes, s_wav_file);
+            s_wav_played_bytes += bytes_read;
+
+            if (bytes_read < max_bytes) {
+                ESP_LOGI(TAG, "WAV decode reached end of file (%lu / %lu bytes)",
+                         (unsigned long)s_wav_played_bytes, (unsigned long)s_wav_total_bytes);
+                s_decode_eof = true;
+                fclose(s_wav_file);
+                s_wav_file = NULL;
+            }
+            return (uint32_t)bytes_read;
+        } else if (s_wav_channels == 1) {
+            uint32_t frames_needed = max_bytes / 4;
+            if (frames_needed > PCM_CHUNK_FRAMES) frames_needed = PCM_CHUNK_FRAMES;
+            size_t mono_bytes = frames_needed * 2;
+
+            static int16_t mono_tmp[PCM_CHUNK_FRAMES];
+            size_t bytes_read = fread(mono_tmp, 1, mono_bytes, s_wav_file);
+            s_wav_played_bytes += bytes_read;
+
+            uint32_t samples_read = bytes_read / 2;
+            int16_t *stereo = (int16_t *)out_buf;
+            for (uint32_t i = 0; i < samples_read; i++) {
+                stereo[i * 2]     = mono_tmp[i];
+                stereo[i * 2 + 1] = mono_tmp[i];
+            }
+
+            if (bytes_read < mono_bytes) {
+                ESP_LOGI(TAG, "Mono WAV decode reached end of file");
+                s_decode_eof = true;
+                fclose(s_wav_file);
+                s_wav_file = NULL;
+            }
+            return samples_read * 4;
+        }
+    }
+
+    return 0;
+}
+
+/* Dedicated background audio decode task running on Core 0 */
+static void audio_decode_task(void *arg)
+{
+    ESP_LOGI(TAG, "Audio decode task started on Core %d", xPortGetCoreID());
+    uint8_t *chunk = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!chunk) {
+        chunk = (uint8_t *)malloc(PCM_CHUNK_BYTES);
+    }
+    if (!chunk) {
+        ESP_LOGE(TAG, "Failed to allocate decode task chunk buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1) {
+        /* Sleep until signaled to refill, or wake periodically (50ms) */
+        xSemaphoreTake(s_decode_sem, pdMS_TO_TICKS(50));
+
+        while (1) {
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+                break;
+            }
+
+            if (s_state != AUDIO_STATE_PLAYING || s_decode_eof) {
+                xSemaphoreGive(s_lock);
+                break;
+            }
+
+            uint32_t filled = ring_available();
+            if (filled >= PCM_HIGH_WATERMARK) {
+                /* Buffer is >= 75% full, sleep until drained */
+                xSemaphoreGive(s_lock);
+                break;
+            }
+
+            uint32_t space = PCM_RING_BUF_SIZE - filled;
+            uint32_t to_decode = (space < PCM_CHUNK_BYTES) ? space : PCM_CHUNK_BYTES;
+            to_decode &= ~3U; /* Align to stereo 16-bit frame */
+            if (to_decode == 0) {
+                xSemaphoreGive(s_lock);
+                break;
+            }
+
+            uint32_t decoded = decode_chunk(chunk, to_decode);
+            xSemaphoreGive(s_lock);
+
+            if (decoded == 0) {
+                break;
+            }
+
+            ring_write(chunk, decoded);
+
+            /* Yield briefly so Core 0 networking/WiFi tasks are never starved */
+            taskYIELD();
+        }
+    }
+}
+
 esp_err_t audio_player_init(void)
 {
     if (s_lock == NULL) {
@@ -224,114 +500,80 @@ esp_err_t audio_player_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    if (s_ring_lock == NULL) {
+        s_ring_lock = xSemaphoreCreateMutex();
+        if (s_ring_lock == NULL) {
+            ESP_LOGE(TAG, "Failed to create ring buffer mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_decode_sem == NULL) {
+        s_decode_sem = xSemaphoreCreateBinary();
+        if (s_decode_sem == NULL) {
+            ESP_LOGE(TAG, "Failed to create decode semaphore");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (s_ring_buf == NULL) {
+        s_ring_buf = (uint8_t *)heap_caps_malloc(PCM_RING_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_ring_buf) {
+            ESP_LOGW(TAG, "Failed to allocate ring buffer in PSRAM, falling back to internal RAM");
+            s_ring_buf = (uint8_t *)malloc(PCM_RING_BUF_SIZE);
+        }
+        if (!s_ring_buf) {
+            ESP_LOGE(TAG, "Failed to allocate ring buffer (%d bytes)", PCM_RING_BUF_SIZE);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Allocated %d KB ring buffer in %s",
+                 PCM_RING_BUF_SIZE / 1024,
+                 esp_ptr_external_ram(s_ring_buf) ? "PSRAM" : "internal RAM");
+    }
+
+    ring_flush();
+
+    if (s_decode_task == NULL) {
+        BaseType_t ret = xTaskCreatePinnedToCore(
+            audio_decode_task,
+            "audio_decode",
+            8192,
+            NULL,
+            5,
+            &s_decode_task,
+            0   /* Pinned to Core 0 */
+        );
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create audio decode task");
+            return ESP_FAIL;
+        }
+    }
+
     s_state = AUDIO_STATE_STOPPED;
     s_source = AUDIO_SOURCE_SINE;
     s_sine_freq = DEFAULT_TONE_FREQ;
     s_sine_phase = 0.0;
-    ESP_LOGI(TAG, "Audio player initialized.");
+    ESP_LOGI(TAG, "Audio player initialized with background decode task.");
     return ESP_OK;
 }
 
+/* Fast non-blocking A2DP data callback (Core 1) - pure memcpy from ring buffer */
 int32_t audio_player_data_cb(uint8_t *data, int32_t len)
 {
     if (len <= 0 || data == NULL) {
         return 0;
     }
 
-    if (xSemaphoreTake(s_lock, 0) != pdTRUE) {
-        /* Mutex contention; output silence to prevent glitching */
-        memset(data, 0, len);
-        return len;
-    }
-
     if (s_state != AUDIO_STATE_PLAYING) {
         memset(data, 0, len);
-        xSemaphoreGive(s_lock);
         return len;
     }
 
-    if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
-        if (s_wav_channels == 2) {
-            size_t bytes_read = fread(data, 1, len, s_wav_file);
-            s_wav_played_bytes += bytes_read;
-
-            if (bytes_read < (size_t)len) {
-                /* End of file reached */
-                memset(data + bytes_read, 0, len - bytes_read);
-                ESP_LOGI(TAG, "WAV playback reached end of file (%lu / %lu bytes)",
-                         (unsigned long)s_wav_played_bytes, (unsigned long)s_wav_total_bytes);
-                fclose(s_wav_file);
-                s_wav_file = NULL;
-                s_state = AUDIO_STATE_STOPPED;
-            }
-        } else if (s_wav_channels == 1) {
-            /* Mono 16-bit: read half into second half of buffer, then expand in place */
-            int mono_samples = len / 4;
-            int mono_bytes = mono_samples * 2;
-            int16_t *mono_buf = (int16_t *)(data + (len / 2));
-            size_t bytes_read = fread(mono_buf, 1, mono_bytes, s_wav_file);
-            s_wav_played_bytes += bytes_read;
-
-            int16_t *stereo_out = (int16_t *)data;
-            int read_samples = bytes_read / 2;
-            for (int i = 0; i < read_samples; i++) {
-                int16_t s = mono_buf[i];
-                stereo_out[i * 2]     = s;
-                stereo_out[i * 2 + 1] = s;
-            }
-            if (bytes_read < (size_t)mono_bytes) {
-                /* Zero pad remaining */
-                int remaining_samples = mono_samples - read_samples;
-                memset(&stereo_out[read_samples * 2], 0, remaining_samples * 4);
-                ESP_LOGI(TAG, "Mono WAV playback reached end of file");
-                fclose(s_wav_file);
-                s_wav_file = NULL;
-                s_state = AUDIO_STATE_STOPPED;
-            }
-        }
-    } else if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
-        if (s_flac_channels == 2) {
-            drflac_uint64 frames_needed = len / 4;
-            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, frames_needed, (drflac_int16 *)data);
-            size_t bytes_read = (size_t)(frames_read * 4);
-            s_flac_played_bytes += bytes_read;
-
-            if (frames_read < frames_needed) {
-                memset(data + bytes_read, 0, len - bytes_read);
-                ESP_LOGI(TAG, "FLAC playback reached end of file (%lu / %lu bytes)",
-                         (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
-                drflac_close(s_flac);
-                s_flac = NULL;
-                s_state = AUDIO_STATE_STOPPED;
-            }
-        } else if (s_flac_channels == 1) {
-            /* Mono 16-bit FLAC: read half into second half of buffer, then duplicate to stereo */
-            int mono_samples = len / 4;
-            int16_t *mono_buf = (int16_t *)(data + (len / 2));
-            drflac_uint64 frames_read = drflac_read_pcm_frames_s16(s_flac, mono_samples, (drflac_int16 *)mono_buf);
-            s_flac_played_bytes += (size_t)(frames_read * 2);
-
-            int16_t *stereo_out = (int16_t *)data;
-            for (int i = 0; i < (int)frames_read; i++) {
-                int16_t s = mono_buf[i];
-                stereo_out[i * 2]     = s;
-                stereo_out[i * 2 + 1] = s;
-            }
-            if (frames_read < (drflac_uint64)mono_samples) {
-                int remaining_samples = mono_samples - (int)frames_read;
-                memset(&stereo_out[frames_read * 2], 0, remaining_samples * 4);
-                ESP_LOGI(TAG, "Mono FLAC playback reached end of file");
-                drflac_close(s_flac);
-                s_flac = NULL;
-                s_state = AUDIO_STATE_STOPPED;
-            }
-        }
-    } else if (s_source == AUDIO_SOURCE_SINE) {
+    if (s_source == AUDIO_SOURCE_SINE) {
         int16_t *pcm = (int16_t *)data;
         int samples = len / 4;
         for (int i = 0; i < samples; i++) {
             double sin_val = sin(s_sine_phase);
-            int16_t val = (int16_t)(sin_val * 16383.0); /* Half volume */
+            int16_t val = (int16_t)(sin_val * 16383.0);
             pcm[i * 2]     = val;
             pcm[i * 2 + 1] = val;
 
@@ -340,10 +582,30 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
                 s_sine_phase -= 2.0 * M_PI;
             }
         }
+    } else if (s_source == AUDIO_SOURCE_WAV || s_source == AUDIO_SOURCE_FLAC) {
+        uint32_t read_bytes = ring_read(data, len);
+
+        if (read_bytes < (uint32_t)len) {
+            /* Buffer underrun or end of stream: pad remainder with silence */
+            memset(data + read_bytes, 0, len - read_bytes);
+
+            if (s_decode_eof && read_bytes == 0) {
+                ESP_LOGI(TAG, "Audio playback reached end of buffered stream.");
+                s_state = AUDIO_STATE_STOPPED;
+                s_decode_eof = false;
+                close_active_file();
+            }
+        }
+
+        /* Wake decode task whenever buffer drains below 50% threshold */
+        if (s_ring_filled < PCM_REFILL_THRESH && !s_decode_eof) {
+            notify_decode_task();
+        }
     } else {
         memset(data, 0, len);
     }
 
+    /* Apply digital volume scaling */
     if (s_volume < 100) {
         int16_t *samples = (int16_t *)data;
         int num_samples = len / 2;
@@ -353,7 +615,6 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
         }
     }
 
-    xSemaphoreGive(s_lock);
     return len;
 }
 
@@ -367,8 +628,10 @@ esp_err_t audio_player_play_file(const char *path)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* Close previously open file */
+    /* Close previously open file and flush ring buffer */
+    s_state = AUDIO_STATE_STOPPED;
     close_active_file();
+    ring_flush();
 
     /* Container auto-detection: check extension or magic bytes */
     bool is_flac = has_extension(path, ".flac");
@@ -411,6 +674,7 @@ esp_err_t audio_player_play_file(const char *path)
         strncpy(s_audio_path, path, sizeof(s_audio_path) - 1);
         s_source = AUDIO_SOURCE_FLAC;
         s_state = AUDIO_STATE_PLAYING;
+        s_decode_eof = false;
 
         double duration_sec = flac->sampleRate > 0 ? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
         ESP_LOGI(TAG, "Playing FLAC: '%s'", path);
@@ -422,48 +686,61 @@ esp_err_t audio_player_play_file(const char *path)
         if (s_flac_sample_rate != 44100) {
             ESP_LOGW(TAG, "FLAC sample rate is %lu Hz. Target is 44100 Hz. Pitch may be shifted without SRC.", (unsigned long)s_flac_sample_rate);
         }
+    } else {
+        /* Process WAV file container */
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            ESP_LOGE(TAG, "Cannot open audio file '%s'", path);
+            xSemaphoreGive(s_lock);
+            return ESP_ERR_NOT_FOUND;
+        }
 
-        xSemaphoreGive(s_lock);
-        if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
-        return ESP_OK;
+        uint32_t data_offset = 0;
+        uint32_t data_len = 0;
+        esp_err_t err = parse_wav_header(f, &data_offset, &data_len);
+        if (err != ESP_OK) {
+            fclose(f);
+            xSemaphoreGive(s_lock);
+            return err;
+        }
+
+        fseek(f, data_offset, SEEK_SET);
+
+        s_wav_file = f;
+        strncpy(s_audio_path, path, sizeof(s_audio_path) - 1);
+        s_wav_data_offset = data_offset;
+        s_wav_total_bytes = data_len;
+        s_wav_played_bytes = 0;
+
+        s_source = AUDIO_SOURCE_WAV;
+        s_state = AUDIO_STATE_PLAYING;
+        s_decode_eof = false;
+
+        double duration_sec = (double)data_len / (s_wav_sample_rate * s_wav_channels * 2);
+        ESP_LOGI(TAG, "Playing WAV: '%s'", path);
+        ESP_LOGI(TAG, "Format: %lu Hz, %u-bit, %s (Duration: %.2f sec, Payload: %lu KB)",
+                 (unsigned long)s_wav_sample_rate, s_wav_bit_depth,
+                 s_wav_channels == 2 ? "Stereo" : "Mono",
+                 duration_sec, (unsigned long)(data_len / 1024));
     }
 
-    /* Process WAV file container */
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        ESP_LOGE(TAG, "Cannot open audio file '%s'", path);
-        xSemaphoreGive(s_lock);
-        return ESP_ERR_NOT_FOUND;
+    /* Pre-fill ring buffer synchronously up to HIGH_WATERMARK before starting A2DP stream */
+    uint8_t *pre_buf = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pre_buf) pre_buf = (uint8_t *)malloc(PCM_CHUNK_BYTES);
+    if (pre_buf) {
+        while (ring_available() < PCM_HIGH_WATERMARK && !s_decode_eof) {
+            uint32_t decoded = decode_chunk(pre_buf, PCM_CHUNK_BYTES);
+            if (decoded == 0) break;
+            ring_write(pre_buf, decoded);
+        }
+        free(pre_buf);
     }
 
-    uint32_t data_offset = 0;
-    uint32_t data_len = 0;
-    esp_err_t err = parse_wav_header(f, &data_offset, &data_len);
-    if (err != ESP_OK) {
-        fclose(f);
-        xSemaphoreGive(s_lock);
-        return err;
-    }
-
-    fseek(f, data_offset, SEEK_SET);
-
-    s_wav_file = f;
-    strncpy(s_audio_path, path, sizeof(s_audio_path) - 1);
-    s_wav_data_offset = data_offset;
-    s_wav_total_bytes = data_len;
-    s_wav_played_bytes = 0;
-
-    s_source = AUDIO_SOURCE_WAV;
-    s_state = AUDIO_STATE_PLAYING;
-
-    double duration_sec = (double)data_len / (s_wav_sample_rate * s_wav_channels * 2);
-    ESP_LOGI(TAG, "Playing WAV: '%s'", path);
-    ESP_LOGI(TAG, "Format: %lu Hz, %u-bit, %s (Duration: %.2f sec, Payload: %lu KB)",
-             (unsigned long)s_wav_sample_rate, s_wav_bit_depth,
-             s_wav_channels == 2 ? "Stereo" : "Mono",
-             duration_sec, (unsigned long)(data_len / 1024));
+    ESP_LOGI(TAG, "Pre-buffered %lu bytes before starting A2DP stream", (unsigned long)ring_available());
 
     xSemaphoreGive(s_lock);
+    notify_decode_task();
+
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
@@ -479,6 +756,7 @@ esp_err_t audio_player_set_tone(double freq_hz)
     }
 
     close_active_file();
+    ring_flush();
 
     s_sine_freq = freq_hz;
     s_sine_phase = 0.0;
@@ -496,6 +774,7 @@ esp_err_t audio_player_play(void)
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
     s_state = AUDIO_STATE_PLAYING;
     ESP_LOGI(TAG, "Audio playback resumed.");
+    notify_decode_task();
     xSemaphoreGive(s_lock);
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
@@ -515,11 +794,13 @@ esp_err_t audio_player_stop(void)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
     close_active_file();
+    ring_flush();
     s_state = AUDIO_STATE_STOPPED;
     s_wav_played_bytes = 0;
     s_flac_played_bytes = 0;
     ESP_LOGI(TAG, "Audio playback stopped.");
     xSemaphoreGive(s_lock);
+    notify_decode_task();
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_STOP);
     return ESP_OK;
 }
@@ -636,7 +917,6 @@ void audio_player_print_status(void)
     cmd_status(0, NULL);
 }
 
-
 void audio_player_register_console_commands(void)
 {
     esp_console_cmd_t play_file_cmd = {
@@ -671,7 +951,6 @@ void audio_player_register_console_commands(void)
     };
     esp_console_cmd_register(&status_cmd);
 
-    /* Override simple play/pause to hook into audio_player engine */
     esp_console_cmd_t play_cmd = {
         .command = "play",
         .help = "Resume audio playback",
