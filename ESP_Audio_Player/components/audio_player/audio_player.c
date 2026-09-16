@@ -485,8 +485,14 @@ static void audio_decode_task(void *arg)
 
             ring_write(chunk, decoded);
 
-            /* Sleep briefly (2 ms) so Core 1 IDLE task feeds the watchdog and system remains responsive */
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* Yield 1 tick (10 ms) every 4 chunks (~16 KB = ~93 ms audio) to feed Core 1 Task Watchdog.
+             * CONFIG_FREERTOS_HZ is 100 Hz, so pdMS_TO_TICKS(2) evaluated to 0 ticks (no-op).
+             * Yielding 1 tick every 4 chunks produces ~93 ms of audio every ~13 ms (7x real-time),
+             * while allowing the Core 1 IDLE task to regularly feed the watchdog. */
+            static uint32_t s_chunk_count = 0;
+            if ((++s_chunk_count & 3) == 0) {
+                vTaskDelay(1);
+            }
         }
     }
 }
@@ -542,12 +548,15 @@ esp_err_t audio_player_init(void)
 
     ring_flush();
 
-    /* Pin decode task to Core 1 at priority 5 (isolated from Core 0 Wi-Fi/BT) */
+    /* Pin decode task to Core 1.
+     * Stack MUST be >= 20 KB: drflac allocates ~12-16 KB of stack for its
+     * LPC synthesis filter arrays on high bit-depth / high blocksize streams.
+     * A stack overflow here causes the silent reboot-on-play symptom. */
     if (s_decode_task == NULL) {
         BaseType_t ret = xTaskCreatePinnedToCore(
             audio_decode_task,
             "audio_decode",
-            8192,
+            32768,              /* 32 KB stack: safe headroom for drflac LPC arrays + WAV fread */
             NULL,
             5,                  /* Priority 5: above idle, cooperates with system */
             &s_decode_task,
@@ -557,6 +566,7 @@ esp_err_t audio_player_init(void)
             ESP_LOGE(TAG, "Failed to create audio decode task on Core 1");
             return ESP_FAIL;
         }
+        ESP_LOGI(TAG, "Decode task created with 32 KB stack on Core 1");
     }
 
     s_state = AUDIO_STATE_STOPPED;
@@ -608,7 +618,10 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
             }
         }
 
-        /* Wake decode task whenever buffer drains below 256 KB threshold */
+        /* Wake decode task whenever buffer drains below 256 KB threshold.
+         * Use a direct read of s_ring_filled (32-bit aligned, Xtensa is
+         * atomic for aligned 32-bit loads) to avoid taking s_ring_lock
+         * inside the latency-critical BT data callback. */
         if (s_ring_filled < PCM_REFILL_THRESH && !s_decode_eof) {
             notify_decode_task();
         }
@@ -735,22 +748,24 @@ esp_err_t audio_player_play_file(const char *path)
                  duration_sec, (unsigned long)(data_len / 1024));
     }
 
-    /* Fast initial pre-buffer of 8 chunks (~32 KB = ~185ms of audio, takes <10ms to decode) */
-    uint8_t *pre_buf = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pre_buf) pre_buf = (uint8_t *)malloc(PCM_CHUNK_BYTES);
-    if (pre_buf) {
-        for (int i = 0; i < 8 && !s_decode_eof; i++) {
-            uint32_t decoded = decode_chunk(pre_buf, PCM_CHUNK_BYTES);
-            if (decoded == 0) break;
-            ring_write(pre_buf, decoded);
+    /* Release lock so the Core 1 decode task can immediately begin filling the ring buffer */
+    xSemaphoreGive(s_lock);
+
+    /* Signal the dedicated decode task on Core 1 (32 KB stack) to start decoding */
+    notify_decode_task();
+
+    /* Wait briefly (up to 300 ms) for Core 1 decode task to pre-buffer at least ~64 KB of audio (or EOF).
+     * ALL decoding executes safely on Core 1's dedicated 32 KB task stack.
+     * The caller task (HTTP server / console) consumes ZERO stack for decoding, completely
+     * eliminating the stack-overflow reboot panic when clicking Play in the Web UI. */
+    for (int i = 0; i < 30; i++) {
+        if (ring_available() >= (64 * 1024) || s_decode_eof) {
+            break;
         }
-        free(pre_buf);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     ESP_LOGI(TAG, "Pre-buffered %lu bytes before starting A2DP stream", (unsigned long)ring_available());
-
-    xSemaphoreGive(s_lock);
-    notify_decode_task();
 
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
