@@ -14,11 +14,11 @@
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
 
-/* High-performance dr_flac options for ESP32 hardware limits */
+/* High-performance dr_flac with zero CRC overhead */
 #define DR_FLAC_IMPLEMENTATION
 #define DR_FLAC_NO_OGG
 #define DR_FLAC_NO_CRC                  /* Eliminate software CRC checks for 30-50% CPU boost */
-#define DR_FLAC_BUFFER_SIZE (64 * 1024) /* 64 KB internal dr_flac stream buffer */
+#define DR_FLAC_BUFFER_SIZE 16384       /* 16 KB internal dr_flac stream buffer */
 #include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";
@@ -26,13 +26,12 @@ static const char *TAG = "AUDIO_PLAYER";
 #define DEFAULT_SAMPLE_RATE 44100
 #define DEFAULT_TONE_FREQ   440.0
 
-/* 1 MEGABYTE PSRAM Ring Buffer: ~5.94 seconds of 44.1kHz 16-bit stereo audio */
-#define PCM_RING_BUF_SIZE   (1024 * 1024)
-#define PCM_REFILL_THRESH   (512 * 1024)            /* Refill as soon as buffer dips below ~3.0 seconds */
-#define PCM_HIGH_WATERMARK  (896 * 1024)            /* Top off up to ~5.1 seconds, then sleep */
-#define PCM_CHUNK_FRAMES    4096                    /* 4096 stereo frames per decode iteration */
-#define PCM_CHUNK_BYTES     (PCM_CHUNK_FRAMES * 4)  /* 16,384 bytes (16 KB) */
-#define FILE_IO_BUFFER_SIZE (64 * 1024)             /* 64 KB PSRAM I/O buffer for setvbuf (multi-block CMD18) */
+/* 512 KB PSRAM Ring Buffer: ~2.97 seconds of 44.1kHz 16-bit stereo audio */
+#define PCM_RING_BUF_SIZE   (512 * 1024)
+#define PCM_REFILL_THRESH   (256 * 1024)            /* Refill when buffer dips below ~1.5 seconds */
+#define PCM_HIGH_WATERMARK  (384 * 1024)            /* Fill up to ~2.2 seconds, then sleep */
+#define PCM_CHUNK_FRAMES    1024                    /* 1024 stereo frames per decode iteration */
+#define PCM_CHUNK_BYTES     (PCM_CHUNK_FRAMES * 4)  /* 4096 bytes (4 KB) */
 
 static SemaphoreHandle_t s_lock = NULL;
 static SemaphoreHandle_t s_ring_lock = NULL;
@@ -40,7 +39,6 @@ static SemaphoreHandle_t s_decode_sem = NULL;
 static TaskHandle_t      s_decode_task = NULL;
 
 static uint8_t          *s_ring_buf = NULL;
-static char             *s_file_io_buf = NULL;
 static int16_t          *s_mono_tmp = NULL;
 
 static uint32_t          s_ring_write = 0;
@@ -66,7 +64,6 @@ static uint32_t s_wav_total_bytes = 0;
 static uint32_t s_wav_played_bytes = 0;
 
 /* FLAC file playback state */
-static FILE *s_flac_file = NULL;
 static drflac *s_flac = NULL;
 static uint32_t s_flac_sample_rate = DEFAULT_SAMPLE_RATE;
 static uint16_t s_flac_channels = 2;
@@ -112,25 +109,6 @@ static drflac_allocation_callbacks s_flac_alloc = {
     .onFree = flac_free,
 };
 
-/* dr_flac custom stream callbacks backed by 64 KB setvbuf PSRAM cache */
-static size_t flac_read_cb(void *pUserData, void *pBufferOut, size_t bytesToRead)
-{
-    return fread(pBufferOut, 1, bytesToRead, (FILE *)pUserData);
-}
-
-static drflac_bool32 flac_seek_cb(void *pUserData, int offset, drflac_seek_origin origin)
-{
-    int whence = (origin == DRFLAC_SEEK_SET) ? SEEK_SET :
-                 (origin == DRFLAC_SEEK_CUR) ? SEEK_CUR : SEEK_END;
-    return (fseek((FILE *)pUserData, offset, whence) == 0) ? DRFLAC_TRUE : DRFLAC_FALSE;
-}
-
-static drflac_bool32 flac_tell_cb(void *pUserData, drflac_int64 *pCursor)
-{
-    *pCursor = (drflac_int64)ftell((FILE *)pUserData);
-    return DRFLAC_TRUE;
-}
-
 static void close_active_file(void)
 {
     if (s_wav_file != NULL) {
@@ -140,10 +118,6 @@ static void close_active_file(void)
     if (s_flac != NULL) {
         drflac_close(s_flac);
         s_flac = NULL;
-    }
-    if (s_flac_file != NULL) {
-        fclose(s_flac_file);
-        s_flac_file = NULL;
     }
 }
 
@@ -459,7 +433,7 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
     return 0;
 }
 
-/* Dedicated background audio decode task running exclusively on Core 1 (240 MHz) */
+/* Dedicated background audio decode task running on Core 1 */
 static void audio_decode_task(void *arg)
 {
     ESP_LOGI(TAG, "Audio decode task running on Core %d at priority %d", xPortGetCoreID(), (int)uxTaskPriorityGet(NULL));
@@ -474,8 +448,8 @@ static void audio_decode_task(void *arg)
     }
 
     while (1) {
-        /* Sleep until signaled or 20ms check */
-        xSemaphoreTake(s_decode_sem, pdMS_TO_TICKS(20));
+        /* Sleep until signaled or 50ms periodic check */
+        xSemaphoreTake(s_decode_sem, pdMS_TO_TICKS(50));
 
         while (1) {
             if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -489,7 +463,7 @@ static void audio_decode_task(void *arg)
 
             uint32_t filled = ring_available();
             if (filled >= PCM_HIGH_WATERMARK) {
-                /* Buffer is full enough (~5.1s of audio), sleep until drained */
+                /* Buffer is full enough (~2.2s of audio), sleep until drained */
                 xSemaphoreGive(s_lock);
                 break;
             }
@@ -511,8 +485,8 @@ static void audio_decode_task(void *arg)
 
             ring_write(chunk, decoded);
 
-            /* Yield briefly */
-            taskYIELD();
+            /* Sleep briefly (2 ms) so Core 1 IDLE task feeds the watchdog and system remains responsive */
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
 }
@@ -541,12 +515,12 @@ esp_err_t audio_player_init(void)
         }
     }
 
-    /* Allocate 1 MB ring buffer in PSRAM */
+    /* Allocate 512 KB ring buffer in PSRAM */
     if (s_ring_buf == NULL) {
         s_ring_buf = (uint8_t *)heap_caps_malloc(PCM_RING_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_ring_buf) {
-            ESP_LOGW(TAG, "Failed to allocate 1MB ring buffer in PSRAM, falling back to 256KB");
-            s_ring_buf = (uint8_t *)heap_caps_malloc(256 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            ESP_LOGW(TAG, "Failed to allocate 512KB ring buffer in PSRAM, falling back to 128KB");
+            s_ring_buf = (uint8_t *)heap_caps_malloc(128 * 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
         if (!s_ring_buf) {
             ESP_LOGE(TAG, "Failed to allocate audio ring buffer");
@@ -558,29 +532,24 @@ esp_err_t audio_player_init(void)
                  (double)PCM_RING_BUF_SIZE / (DEFAULT_SAMPLE_RATE * 4.0));
     }
 
-    /* Allocate 64 KB File I/O cache buffer in PSRAM for setvbuf multiblock streaming */
-    if (s_file_io_buf == NULL) {
-        s_file_io_buf = (char *)heap_caps_malloc(FILE_IO_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_file_io_buf) {
-            ESP_LOGI(TAG, "Allocated %d KB multi-block SD streaming buffer in PSRAM", FILE_IO_BUFFER_SIZE / 1024);
-        }
-    }
-
-    /* Allocate mono conversion buffer in PSRAM */
+    /* Allocate mono conversion buffer */
     if (s_mono_tmp == NULL) {
         s_mono_tmp = (int16_t *)heap_caps_malloc(PCM_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_mono_tmp) {
+            s_mono_tmp = (int16_t *)malloc(PCM_CHUNK_FRAMES * sizeof(int16_t));
+        }
     }
 
     ring_flush();
 
-    /* Pin decode task to Core 1 at priority 10 (dedicated CPU core isolated from Core 0 Wi-Fi/BT) */
+    /* Pin decode task to Core 1 at priority 5 (isolated from Core 0 Wi-Fi/BT) */
     if (s_decode_task == NULL) {
         BaseType_t ret = xTaskCreatePinnedToCore(
             audio_decode_task,
             "audio_decode",
             8192,
             NULL,
-            10,                 /* Priority 10: high priority for real-time decoding */
+            5,                  /* Priority 5: above idle, cooperates with system */
             &s_decode_task,
             1                   /* Pinned to Core 1 (APP_CPU) */
         );
@@ -594,7 +563,7 @@ esp_err_t audio_player_init(void)
     s_source = AUDIO_SOURCE_SINE;
     s_sine_freq = DEFAULT_TONE_FREQ;
     s_sine_phase = 0.0;
-    ESP_LOGI(TAG, "Audio player engine fully initialized (Core 1 pinned, 1MB PSRAM buffer).");
+    ESP_LOGI(TAG, "Audio player engine fully initialized (Core 1 pinned, 512KB PSRAM buffer).");
     return ESP_OK;
 }
 
@@ -639,7 +608,7 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
             }
         }
 
-        /* Wake decode task whenever buffer drains below 512 KB threshold */
+        /* Wake decode task whenever buffer drains below 256 KB threshold */
         if (s_ring_filled < PCM_REFILL_THRESH && !s_decode_eof) {
             notify_decode_task();
         }
@@ -692,22 +661,9 @@ esp_err_t audio_player_play_file(const char *path)
     }
 
     if (is_flac) {
-        FILE *f = fopen(path, "rb");
-        if (!f) {
-            ESP_LOGE(TAG, "Cannot open FLAC file '%s'", path);
-            xSemaphoreGive(s_lock);
-            return ESP_ERR_NOT_FOUND;
-        }
-
-        /* Attach 64 KB PSRAM stream cache to eliminate FATFS seek stalls */
-        if (s_file_io_buf) {
-            setvbuf(f, s_file_io_buf, _IOFBF, FILE_IO_BUFFER_SIZE);
-        }
-
-        drflac *flac = drflac_open(flac_read_cb, flac_seek_cb, flac_tell_cb, (void *)f, &s_flac_alloc);
+        drflac *flac = drflac_open_file(path, &s_flac_alloc);
         if (!flac) {
-            ESP_LOGE(TAG, "Cannot decode FLAC stream '%s'", path);
-            fclose(f);
+            ESP_LOGE(TAG, "Cannot decode FLAC file '%s'", path);
             xSemaphoreGive(s_lock);
             return ESP_ERR_INVALID_ARG;
         }
@@ -715,12 +671,10 @@ esp_err_t audio_player_play_file(const char *path)
         if (flac->channels > 2 || flac->channels == 0) {
             ESP_LOGE(TAG, "Unsupported FLAC channels (%u). Only Mono and Stereo supported.", flac->channels);
             drflac_close(flac);
-            fclose(f);
             xSemaphoreGive(s_lock);
             return ESP_ERR_NOT_SUPPORTED;
         }
 
-        s_flac_file = f;
         s_flac = flac;
         s_flac_sample_rate = flac->sampleRate;
         s_flac_channels = flac->channels;
@@ -752,11 +706,6 @@ esp_err_t audio_player_play_file(const char *path)
             return ESP_ERR_NOT_FOUND;
         }
 
-        /* Attach 64 KB PSRAM stream cache */
-        if (s_file_io_buf) {
-            setvbuf(f, s_file_io_buf, _IOFBF, FILE_IO_BUFFER_SIZE);
-        }
-
         uint32_t data_offset = 0;
         uint32_t data_len = 0;
         esp_err_t err = parse_wav_header(f, &data_offset, &data_len);
@@ -786,11 +735,11 @@ esp_err_t audio_player_play_file(const char *path)
                  duration_sec, (unsigned long)(data_len / 1024));
     }
 
-    /* Pre-fill ring buffer synchronously up to PCM_REFILL_THRESH (~3.0 sec) before starting A2DP stream */
+    /* Fast initial pre-buffer of 8 chunks (~32 KB = ~185ms of audio, takes <10ms to decode) */
     uint8_t *pre_buf = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!pre_buf) pre_buf = (uint8_t *)malloc(PCM_CHUNK_BYTES);
     if (pre_buf) {
-        while (ring_available() < PCM_REFILL_THRESH && !s_decode_eof) {
+        for (int i = 0; i < 8 && !s_decode_eof; i++) {
             uint32_t decoded = decode_chunk(pre_buf, PCM_CHUNK_BYTES);
             if (decoded == 0) break;
             ring_write(pre_buf, decoded);
@@ -798,8 +747,7 @@ esp_err_t audio_player_play_file(const char *path)
         free(pre_buf);
     }
 
-    ESP_LOGI(TAG, "Pre-buffered %lu bytes (~%.2f sec) before starting A2DP stream",
-             (unsigned long)ring_available(), (double)ring_available() / (DEFAULT_SAMPLE_RATE * 4.0));
+    ESP_LOGI(TAG, "Pre-buffered %lu bytes before starting A2DP stream", (unsigned long)ring_available());
 
     xSemaphoreGive(s_lock);
     notify_decode_task();

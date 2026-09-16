@@ -37,7 +37,7 @@ esp_err_t sd_card_init(void)
     /* Initialize SDMMC host in 1-bit mode */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; /* 40 MHz high-speed mode for max throughput */
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT; /* 20 MHz rock-solid mode for 1-bit internal pullup bus */
 
     /* Configure Slot 1 for 1-bit width */
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
