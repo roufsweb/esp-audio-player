@@ -14,11 +14,13 @@
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
 
-/* High-performance dr_flac with zero CRC overhead */
+/* High-performance dr_flac with zero CRC overhead and lean memory profile */
 #define DR_FLAC_IMPLEMENTATION
 #define DR_FLAC_NO_OGG
 #define DR_FLAC_NO_CRC                  /* Eliminate software CRC checks for 30-50% CPU boost */
-#define DR_FLAC_BUFFER_SIZE 16384       /* 16 KB internal dr_flac stream buffer */
+#define DR_FLAC_NO_SIMD                 /* Xtensa LX6 has no x86/ARM SIMD */
+#define DR_FLAC_NO_PICTURE_METADATA_MALLOC /* Never allocate RAM for embedded album art */
+#define DR_FLAC_BUFFER_SIZE 4096        /* 4 KB stream buffer */
 #include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";
@@ -437,7 +439,7 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
 static void audio_decode_task(void *arg)
 {
     ESP_LOGI(TAG, "Audio decode task running on Core %d at priority %d", xPortGetCoreID(), (int)uxTaskPriorityGet(NULL));
-    uint8_t *chunk = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *chunk = (uint8_t *)heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!chunk) {
         chunk = (uint8_t *)malloc(PCM_CHUNK_BYTES);
     }
@@ -540,7 +542,7 @@ esp_err_t audio_player_init(void)
 
     /* Allocate mono conversion buffer */
     if (s_mono_tmp == NULL) {
-        s_mono_tmp = (int16_t *)heap_caps_malloc(PCM_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_mono_tmp = (int16_t *)heap_caps_malloc(PCM_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_mono_tmp) {
             s_mono_tmp = (int16_t *)malloc(PCM_CHUNK_FRAMES * sizeof(int16_t));
         }
@@ -548,15 +550,14 @@ esp_err_t audio_player_init(void)
 
     ring_flush();
 
-    /* Pin decode task to Core 1.
-     * Stack MUST be >= 20 KB: drflac allocates ~12-16 KB of stack for its
-     * LPC synthesis filter arrays on high bit-depth / high blocksize streams.
-     * A stack overflow here causes the silent reboot-on-play symptom. */
+    /* Pin decode task to Core 1 at priority 5.
+     * 8 KB stack provides plenty of headroom for dr_flac (< 1.5 KB stack usage)
+     * while preserving critical internal DRAM needed for Bluetooth and Wi-Fi. */
     if (s_decode_task == NULL) {
         BaseType_t ret = xTaskCreatePinnedToCore(
             audio_decode_task,
             "audio_decode",
-            32768,              /* 32 KB stack: safe headroom for drflac LPC arrays + WAV fread */
+            8192,               /* 8 KB stack: ample headroom for dr_flac while protecting DRAM */
             NULL,
             5,                  /* Priority 5: above idle, cooperates with system */
             &s_decode_task,
@@ -566,7 +567,7 @@ esp_err_t audio_player_init(void)
             ESP_LOGE(TAG, "Failed to create audio decode task on Core 1");
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "Decode task created with 32 KB stack on Core 1");
+        ESP_LOGI(TAG, "Decode task created with 8 KB stack on Core 1");
     }
 
     s_state = AUDIO_STATE_STOPPED;
