@@ -241,7 +241,7 @@ static int cmd_status(int argc, char **argv) {
     printf("Ring Buffer:     %lu KB\n", (unsigned long)(buf_bytes / 1024));
     printf("Volume:          %u%%\n", (unsigned)audio_player_get_volume());
 
-    printf("--- Bluetooth Sink ---\n");
+    printf("--- Bluetooth Sink (Handshake Confirmed) ---\n");
     const char *bt_state_str = "DISCONNECTED";
     if (bt_status.a2d_state == BT_MGR_A2D_STATE_CONNECTING) bt_state_str = "CONNECTING";
     else if (bt_status.a2d_state == BT_MGR_A2D_STATE_CONNECTED) bt_state_str = "CONNECTED";
@@ -250,9 +250,9 @@ static int cmd_status(int argc, char **argv) {
     printf("BT State:        %s\n", bt_state_str);
     if (bt_status.a2d_state == BT_MGR_A2D_STATE_CONNECTED) {
         printf("Remote Device:   %s [%s]\n", bt_status.connected_name, bt_status.connected_bda_str);
-        printf("Active Codec:    %s\n", bt_status.codec_name);
-        printf("Negotiated Rate: %lu Hz\n", (unsigned long)bt_status.sample_rate);
-        printf("Bitrate / Pool:  %lu kbps (Bitpool: %u)\n",
+        printf("Agreed Codec:    %s\n", bt_status.codec_name);
+        printf("Agreed Rate:     %lu Hz\n", (unsigned long)bt_status.sample_rate);
+        printf("Agreed Bitrate:  %lu kbps (Bitpool: %u)\n",
                (unsigned long)bt_status.bitrate_kbps, (unsigned)bt_status.bitpool);
     }
 

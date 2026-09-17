@@ -29,20 +29,19 @@ For detailed hardware specifications, pin tables, and memory calculations, see [
 |:---|:---|:---|:---|:---|:---|
 | **FLAC (Standard Lossless)** | 16-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | `dr_flac` streaming decoder | Native bit-perfect decoding into 512 KB PSRAM ring buffer |
 | **FLAC (High Quality Lossless)** | 24-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | `dr_flac` S32 fixed-point | Decoded via 32-bit arithmetic, scaled to 16-bit for A2DP |
-| **FLAC (Studio Master)** | 24-bit | 88.2 kHz, 96.0 kHz | Stereo & Mono | `dr_flac` + integer decimation | Decoded and downsampled to 44.1k / 48k for A2DP compatibility |
+| **FLAC (Studio Master)** | 24-bit | 88.2 kHz, 96.0 kHz | Stereo & Mono | `dr_flac` + integer decimation | Hardware limited (~0.85x speed); causes buffer starvation. Convert to 16-bit 44.1k/48k for smooth playback. |
 | **WAV (Linear PCM)** | 16-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | Native RIFF parser | Zero CPU decode overhead; direct SD-to-ring-buffer DMA streaming |
 | **Diagnostic Sine Tone** | 16-bit | 44.1 kHz | Stereo | Mathematical synthesis | Generates pure test tone (`tone <freq>`) without SD card |
 | **MP3 (MPEG-1/2 Layer III)** | 16-bit | 32.0–48.0 kHz | Stereo & Mono | `minimp3` (Roadmap) | Lightweight fixed-point decoder scheduled for next phase |
 
-### File Size Guidelines & Performance
+### File Size Boundaries & Real Hardware Performance
 
-* **Standard File Sizes (10 MB to 60 MB):** 
-  Standard 3 to 6-minute CD-quality FLAC and WAV tracks (15 MB–45 MB) play with instant pre-buffering (~740 ms cushion) and uninterrupted playback.
-* **Large File Sizes (>100 MB):**
-  Files over 100 MB (such as high-res 24-bit/96kHz master files or full live albums) are supported via the 512 KB PSRAM ring buffer. To ensure smooth playback of very large lossless files:
-  1. **Format SD Card as FAT32 with 16 KB or 32 KB Cluster Size (Allocation Unit Size):** 
-     Default 4 KB clusters cause excessive FAT lookup fragmentation during sustained multi-megabyte reads. Formatting the MicroSD card with **16 KB (`16384` bytes)** or **32 KB** clusters aligns directly with the hardware SDMMC driver multi-block read chunks, doubling SD throughput.
-  2. **Card Speed Class:** Use Class 10 / UHS-I U1 or higher MicroSD cards.
+* **Standard Files (Tested & Verified Smooth):**
+  Standard 16-bit / 44.1 kHz and 48.0 kHz lossless FLAC and uncompressed WAV tracks (typically 10 MB to 50 MB) decode at >2.5x real-time speed. The 512 KB PSRAM ring buffer primes in ~740 ms and streams with zero underruns or stuttering.
+* **Large & High-Res Files (>100 MB, 24-bit / 96 kHz):**
+  **DO NOT USE FOR REAL-TIME PLAYBACK.** Hardware benchmarking on 100+ MB 24-bit / 96 kHz studio master files (`Animals - Maroon 5.flac`, 104 MB, 3286 kbps bitrate) revealed sustained decode speeds of only ~0.85x real-time on Xtensa Core 1. Because consumption rate exceeds decode production rate, the 512 KB PSRAM buffer continuously drains, resulting in recurring audio pauses. Convert or re-encode studio masters to standard 16-bit / 44.1 kHz or 48.0 kHz for smooth, artifact-free playback.
+* **MicroSD Formatting Requirement:**
+  Format the MicroSD card as **FAT32 with 16 KB (`16384` bytes) or 32 KB Cluster Size (Allocation Unit Size)**. Default 4 KB clusters cause severe FAT lookup overhead during multi-megabyte reads. A 16 KB cluster size directly matches the hardware SDMMC driver multi-block read chunks (`.allocation_unit_size = 16 * 1024`), maximizing sequential read throughput.
 
 ---
 

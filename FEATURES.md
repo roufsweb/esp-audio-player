@@ -11,7 +11,7 @@ This document tracks all implemented, active, and roadmap features for the ESP32
 | **WAV Playback** | 16-bit uncompressed PCM (44.1 kHz, 48.0 kHz) | Fully Functional | Zero CPU overhead, bit-perfect streaming |
 | **FLAC (Standard)** | 16-bit / 44.1 kHz lossless audio | Fully Functional | dr_flac decoder with PSRAM ring buffer |
 | **FLAC (High Quality)**| 24-bit / 48.0 kHz lossless audio | Fully Functional | Fixed-point decoding |
-| **FLAC (High-Res 96k)**| 24-bit / 96.0 kHz studio masters | Downsampled | Downsampled to 44.1k/48k for A2DP compatibility |
+| **FLAC (High-Res 96k)**| 24-bit / 96.0 kHz studio masters (>100 MB) | Hardware Limited | Decode speed ~0.85x causes buffer starvation. Convert to 16-bit 44.1k/48k for smooth playback. |
 | **Sine Tone Generator**| Diagnostic mathematical tone synthesis | Fully Functional | Available via `tone <freq>` |
 | **Audio Seeking / Scrubbing**| Fast-Forward (+10s), Rewind (-10s), Absolute Seek | Fully Functional | `seek <sec>`, `ff [sec]`, `rew [sec]` |
 | **MP3 Playback** | Standard MPEG-1/2 Audio Layer III | Planned | Targeted via lightweight `minimp3` |

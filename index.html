@@ -764,27 +764,27 @@
             <button class="btn-disconnect btn-sm" id="btnDisconnectBt" style="display: none;" onclick="sendCmd('disconnect')">Disconnect</button>
           </div>
 
-          <!-- NEGOTIATED CODEC & STREAM QUALITY TELEMETRY -->
+          <!-- CONFIRMED BLUETOOTH HANDSHAKE TELEMETRY -->
           <div id="btStreamQualityBox" style="margin-top: 10px; padding: 12px 14px; background: rgba(0, 242, 254, 0.03); border: 1px solid rgba(0, 242, 254, 0.12); border-radius: 10px;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-              <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.8px; color: var(--cyan); font-weight: 700;">Negotiated Stream Quality</span>
+              <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.8px; color: var(--cyan); font-weight: 700;">Confirmed Bluetooth Handshake</span>
               <span class="badge" id="btStreamStateBadge" style="font-size: 0.68rem; padding: 2px 8px;">DISCONNECTED</span>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.8rem;">
               <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
-                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">A2DP Codec</div>
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Agreed Codec</div>
                 <div style="font-weight: 700; color: #fff; font-family: var(--font-mono); margin-top: 2px;" id="btCodecVal">--</div>
               </div>
               <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
-                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Stream Bitrate</div>
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Agreed Bitrate</div>
                 <div style="font-weight: 700; color: var(--cyan); font-family: var(--font-mono); margin-top: 2px;" id="btBitrateVal">-- kbps</div>
               </div>
               <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
-                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Bitpool / Param</div>
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Agreed Bitpool</div>
                 <div style="font-weight: 600; color: #cbd5e1; font-family: var(--font-mono); margin-top: 2px;" id="btBitpoolVal">--</div>
               </div>
               <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
-                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">A2DP Sample Rate</div>
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Agreed Sample Rate</div>
                 <div style="font-weight: 600; color: #cbd5e1; font-family: var(--font-mono); margin-top: 2px;" id="btSampleRateVal">-- kHz</div>
               </div>
             </div>
@@ -1175,8 +1175,8 @@
       const pillBt = document.getElementById('pillBtCodec');
       if (pillBt) {
         if (s.bt_state === 'CONNECTED') {
-          const cName = (s.bt_codec && s.bt_codec !== 'None') ? s.bt_codec : 'SBC';
-          const bRate = s.bt_bitrate ? `${s.bt_bitrate} kbps` : '';
+          const cName = (s.bt_codec && s.bt_codec !== 'None') ? s.bt_codec : 'Connected';
+          const bRate = s.bt_bitrate ? `(${s.bt_bitrate} kbps)` : '';
           pillBt.innerText = `BT: ${cName} ${bRate}`.trim();
           pillBt.style.borderColor = 'rgba(0, 242, 254, 0.4)';
           pillBt.style.color = 'var(--cyan)';
@@ -1270,31 +1270,32 @@
       const btStreamStateBadge = document.getElementById('btStreamStateBadge');
 
       if (s.bt_state === 'CONNECTED') {
-        if (btCodecVal) btCodecVal.innerText = (s.bt_codec && s.bt_codec !== 'None') ? s.bt_codec : 'SBC';
+        const hasValidCodec = s.bt_codec && s.bt_codec !== 'None';
+        if (btCodecVal) btCodecVal.innerText = hasValidCodec ? s.bt_codec : 'Negotiating...';
         if (btBitrateVal) btBitrateVal.innerText = s.bt_bitrate ? `${s.bt_bitrate} kbps` : '-- kbps';
-        if (btBitpoolVal) btBitpoolVal.innerText = s.bt_bitpool ? `Bitpool: ${s.bt_bitpool}` : 'Bitpool: 38 (XQ)';
-        if (btSampleRateVal) btSampleRateVal.innerText = s.bt_rate ? `${(s.bt_rate / 1000).toFixed(1)} kHz` : '44.1 kHz';
+        if (btBitpoolVal) btBitpoolVal.innerText = s.bt_bitpool ? `Bitpool: ${s.bt_bitpool}` : '--';
+        if (btSampleRateVal) btSampleRateVal.innerText = s.bt_rate ? `${(s.bt_rate / 1000).toFixed(1)} kHz` : '-- kHz';
 
         if (btStreamStateBadge) {
-          if (s.bt_codec && s.bt_codec.includes('XQ')) {
-            btStreamStateBadge.innerText = 'SBC XQ HIGH-DEF';
-            btStreamStateBadge.style.background = 'rgba(0, 242, 254, 0.15)';
-            btStreamStateBadge.style.color = 'var(--cyan)';
-            btStreamStateBadge.style.borderColor = 'rgba(0, 242, 254, 0.35)';
-          } else {
-            btStreamStateBadge.innerText = 'HQ STEREO';
+          if (hasValidCodec) {
+            btStreamStateBadge.innerText = 'HANDSHAKE VERIFIED';
             btStreamStateBadge.style.background = 'rgba(16, 185, 129, 0.15)';
             btStreamStateBadge.style.color = 'var(--emerald)';
-            btStreamStateBadge.style.borderColor = 'rgba(16, 185, 129, 0.35)';
+            btStreamStateBadge.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+          } else {
+            btStreamStateBadge.innerText = 'NEGOTIATING...';
+            btStreamStateBadge.style.background = 'rgba(245, 158, 11, 0.15)';
+            btStreamStateBadge.style.color = 'var(--amber)';
+            btStreamStateBadge.style.borderColor = 'rgba(245, 158, 11, 0.35)';
           }
         }
       } else if (s.bt_state === 'CONNECTING') {
-        if (btCodecVal) btCodecVal.innerText = 'Negotiating...';
+        if (btCodecVal) btCodecVal.innerText = 'Connecting...';
         if (btBitrateVal) btBitrateVal.innerText = '-- kbps';
         if (btBitpoolVal) btBitpoolVal.innerText = '--';
         if (btSampleRateVal) btSampleRateVal.innerText = '-- kHz';
         if (btStreamStateBadge) {
-          btStreamStateBadge.innerText = 'NEGOTIATING...';
+          btStreamStateBadge.innerText = 'CONNECTING';
           btStreamStateBadge.style.background = 'rgba(245, 158, 11, 0.15)';
           btStreamStateBadge.style.color = 'var(--amber)';
           btStreamStateBadge.style.borderColor = 'rgba(245, 158, 11, 0.35)';

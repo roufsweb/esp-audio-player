@@ -885,6 +885,36 @@ void bta_av_co_audio_open(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT8 *p_
     } else {
         p_peer->opened = TRUE;
         p_peer->mtu = mtu;
+
+        /* Confirm true negotiated handshake parameters from peer codec_cfg */
+        tA2D_SBC_CIE sbc_cie;
+        const UINT8 *p_cfg = (p_codec_info != NULL) ? p_codec_info : p_peer->codec_cfg;
+        if (A2D_ParsSbcInfo(&sbc_cie, (UINT8 *)p_cfg, FALSE) == A2D_SUCCESS) {
+            UINT32 sbc_rate = (sbc_cie.samp_freq & A2D_SBC_IE_SAMP_FREQ_48) ? 48000 : 44100;
+            UINT8 bp = sbc_cie.max_bitpool;
+            UINT32 calc_bitrate = 0;
+
+            if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
+                strncpy(s_active_codec_info.codec_name, "SBC XQ (Dual Ch)", sizeof(s_active_codec_info.codec_name) - 1);
+                calc_bitrate = ((12 + 4 * (UINT32)bp) * sbc_rate) / 16000;
+            } else if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
+                strncpy(s_active_codec_info.codec_name, "SBC (Joint Stereo)", sizeof(s_active_codec_info.codec_name) - 1);
+                calc_bitrate = ((13 + 2 * (UINT32)bp) * sbc_rate) / 16000;
+            } else if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
+                strncpy(s_active_codec_info.codec_name, "SBC (Stereo)", sizeof(s_active_codec_info.codec_name) - 1);
+                calc_bitrate = ((12 + 2 * (UINT32)bp) * sbc_rate) / 16000;
+            } else {
+                strncpy(s_active_codec_info.codec_name, "SBC (Mono)", sizeof(s_active_codec_info.codec_name) - 1);
+                calc_bitrate = ((8 + (UINT32)bp) * sbc_rate) / 16000;
+            }
+            s_active_codec_info.sample_rate = sbc_rate;
+            s_active_codec_info.bitpool = bp;
+            s_active_codec_info.bitrate_kbps = calc_bitrate;
+            s_active_codec_info.valid = TRUE;
+
+            APPL_TRACE_EVENT("bta_av_co_audio_open: True handshake confirmed -> %s @ %lu kbps (Bitpool: %d, Rate: %lu Hz, MTU: %d)",
+                             s_active_codec_info.codec_name, (unsigned long)calc_bitrate, bp, (unsigned long)sbc_rate, mtu);
+        }
     }
 }
 
@@ -1872,14 +1902,60 @@ BOOLEAN bta_av_co_get_remote_bitpool_pref(UINT8 *min, UINT8 *max)
 
 BOOLEAN bta_av_co_get_active_codec_info(char *codec_name, size_t max_name_len, UINT32 *rate, UINT32 *bitrate_kbps, UINT8 *bitpool)
 {
+    /* Dynamically inspect active open peer for true negotiated handshake */
+    for (UINT8 i = 0; i < BTA_AV_CO_NUM_ELEMENTS(bta_av_co_cb.peers); i++) {
+        tBTA_AV_CO_PEER *p_peer = &bta_av_co_cb.peers[i];
+        if (p_peer->opened) {
+            tA2D_SBC_CIE sbc_cie;
+            if (A2D_ParsSbcInfo(&sbc_cie, p_peer->codec_cfg, FALSE) == A2D_SUCCESS) {
+                UINT32 sbc_rate = (sbc_cie.samp_freq & A2D_SBC_IE_SAMP_FREQ_48) ? 48000 : 44100;
+                UINT8 bp = sbc_cie.max_bitpool;
+                UINT32 calc_bitrate = 0;
+
+                if (codec_name && max_name_len > 0) {
+                    if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
+                        strncpy(codec_name, "SBC XQ (Dual Ch)", max_name_len - 1);
+                        calc_bitrate = ((12 + 4 * (UINT32)bp) * sbc_rate) / 16000;
+                    } else if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
+                        strncpy(codec_name, "SBC (Joint Stereo)", max_name_len - 1);
+                        calc_bitrate = ((13 + 2 * (UINT32)bp) * sbc_rate) / 16000;
+                    } else if (sbc_cie.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
+                        strncpy(codec_name, "SBC (Stereo)", max_name_len - 1);
+                        calc_bitrate = ((12 + 2 * (UINT32)bp) * sbc_rate) / 16000;
+                    } else {
+                        strncpy(codec_name, "SBC (Mono)", max_name_len - 1);
+                        calc_bitrate = ((8 + (UINT32)bp) * sbc_rate) / 16000;
+                    }
+                    codec_name[max_name_len - 1] = '\0';
+                }
+
+                if (rate) *rate = sbc_rate;
+                if (bitrate_kbps) *bitrate_kbps = calc_bitrate;
+                if (bitpool) *bitpool = bp;
+                return TRUE;
+            }
+        }
+    }
+
+    if (s_active_codec_info.valid) {
+        if (codec_name && max_name_len > 0) {
+            strncpy(codec_name, s_active_codec_info.codec_name, max_name_len - 1);
+            codec_name[max_name_len - 1] = '\0';
+        }
+        if (rate) *rate = s_active_codec_info.sample_rate;
+        if (bitrate_kbps) *bitrate_kbps = s_active_codec_info.bitrate_kbps;
+        if (bitpool) *bitpool = s_active_codec_info.bitpool;
+        return TRUE;
+    }
+
     if (codec_name && max_name_len > 0) {
-        strncpy(codec_name, s_active_codec_info.valid ? s_active_codec_info.codec_name : "None", max_name_len - 1);
+        strncpy(codec_name, "None", max_name_len - 1);
         codec_name[max_name_len - 1] = '\0';
     }
-    if (rate) *rate = s_active_codec_info.sample_rate;
-    if (bitrate_kbps) *bitrate_kbps = s_active_codec_info.bitrate_kbps;
-    if (bitpool) *bitpool = s_active_codec_info.bitpool;
-    return s_active_codec_info.valid;
+    if (rate) *rate = 0;
+    if (bitrate_kbps) *bitrate_kbps = 0;
+    if (bitpool) *bitpool = 0;
+    return FALSE;
 }
 
 /* the call out functions for audio stream */
