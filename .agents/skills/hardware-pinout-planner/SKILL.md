@@ -25,20 +25,22 @@ This skill provides verified hardware data and pin conflict management for the E
    - GPIO2: Must be LOW or floating during boot; tied to SD Data 0 and on-board pull-down.
    - GPIO12: MTDI strapping pin; boot voltage level (must be LOW at boot for 3.3V flash LDO).
    - GPIO15: MTDO strapping pin; controls boot messages over UART.
-4. On-board Peripherals on Standard ESP32-CAM:
-   - GPIO4: Flashlight / High-power LED (also SD Data 1 in 4-bit SDMMC).
-   - GPIO33: Small inverted status LED.
-   - MicroSD Slot (built-in): Uses GPIO14 (CLK), GPIO15 (CMD), GPIO2 (DAT0), GPIO4 (DAT1), GPIO12 (DAT2), GPIO13 (DAT3).
-   - Camera Header Pins (reclaimable when camera is detached):
-     - GPIO32 (XCLK), GPIO0 (SIOC), GPIO26 (SIOD), GPIO27 (VSYNC), GPIO25 (HREF), GPIO21 (PCLK).
-     - Camera data bus: GPIO5 (Y2), GPIO18 (Y3), GPIO19 (Y4), GPIO36 (Y5/VP), GPIO39 (Y6/VN), GPIO34 (Y7), GPIO35 (Y8), GPIO12 (Y9).
-     - Note: GPIO34, 35, 36, 39 are input-only pins (no internal pull-up/pull-down or output drivers).
+4. On-board Peripherals on HW-297 (Reclaimed):
+   - **Camera: PERMANENTLY ELIMINATED.** The OV2640 camera is discarded. All 24 camera pins on the FPC connector/pads are reclaimed for Nokia C1-01 display, user controls, and expansion.
+   - **GPIO4 (Flashlight LED & MOSFET):** User desoldered the high-power white LED. Recommended action: Desolder the SOT-23 MOSFET on GPIO4 to remove the gate capacitance and 10kΩ pull-down to GND. GPIO4 then becomes a clean GPIO on the outer header (J1 Pin 8) for Display Reset (`TFT_RST`), Display Backlight PWM (`TFT_BL`), or general I/O.
+   - **GPIO33:** Small inverted red status LED.
+   - **MicroSD Slot (1-Bit SDMMC Mode):** Uses GPIO14 (CLK), GPIO15 (CMD), GPIO2 (DAT0). Frees GPIO4, GPIO12, and GPIO13.
+   - **Nokia C1-01 Display (9-bit SPI):**
+     - `TFT_CS`: GPIO 5 (Reclaimed Camera Y2 on FPC)
+     - `TFT_SCK`: GPIO 18 (Reclaimed Camera Y3 on FPC, Hardware VSPI SCLK)
+     - `TFT_MOSI`: GPIO 19 (Reclaimed Camera Y4 on FPC, Hardware VSPI MOSI)
+     - `TFT_RST`: GPIO 4 (outer header J1 Pin 8) or GPIO 13 (outer header J1 Pin 4) or GPIO 21 (FPC)
+     - `TFT_BL`: GPIO 4 (outer header J1 Pin 8) or 3.3V rail.
+   - **Input-Only Pins:** GPIO 34, 35, 36, 39 (no internal pull-up/down, input only for buttons/ADC).
 
 ## 2. Pinout Conflict Check Protocol
 When assigning pins for the Display (SPI: MOSI, SCK, CS, DC, RST) or user controls (buttons, rotary encoder):
 1. Check if the pin is Input-Only (GPIO 34, 35, 36, 39 can only be used as inputs, e.g., ADC, buttons with external pull-ups).
-2. Check if the pin conflicts with the SDMMC bus mode (1-bit vs 4-bit):
-   - 1-bit SDMMC mode frees GPIO4, GPIO12, and GPIO13 for other duties.
-   - 4-bit SDMMC mode requires GPIO2, 4, 12, 13, 14, 15.
-3. Check if the pin affects strapping levels during power-on or reset.
+2. Check if the pin conflicts with the SDMMC bus mode (1-bit mode frees GPIO4, GPIO12, and GPIO13).
+3. Check if the pin affects strapping levels during power-on or reset (GPIO 0, 2, 12, 15).
 4. Verify physical continuity and logic levels with the user before finalizing assignments.

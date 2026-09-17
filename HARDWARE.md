@@ -43,72 +43,92 @@ Reference image: `hardware/esp32cam_hw297_top.png`
 
 ## 2. Pin Mapping & Peripheral Reclamation
 
-Because the camera module is removed/ditched, all 24 camera FPC signals are available for peripheral re-allocation. The on-board MicroSD slot is used for audio file storage.
+### A. Permanent Camera Elimination
+* **Camera Status:** **PERMANENTLY ELIMINATED / EXCLUDED.**
+  * The OV2640 camera module is removed and will not be used in this project.
+  * All 24 camera signals (FPC connector and internal pads) are permanently reclaimed for the **Nokia C1-01 LCD display**, user input controls (rotary encoder, buttons), and future expansion.
+  * Dedicated camera clocks (XCLK) and power management (PWDN) are completely deactivated.
 
-### A. On-Board MicroSD Card Slot
-The MicroSD card slot on the underside of the HW-297 PCB is routed to the ESP32 hardware SDMMC Host:
-
-| SDMMC Signal | ESP32 GPIO | Header Pin | Notes |
-|:-------------|:-----------|:-----------|:------|
-| `SD_CLK`     | GPIO14     | J1 Pin 7   | Clock line |
-| `SD_CMD`     | GPIO15     | J1 Pin 6   | Command/Response (Strapping pin MTDO; has 10k pull-up) |
-| `SD_DAT0`    | GPIO2      | J1 Pin 8   | Data 0 (Strapping pin; bootloader pull-down) |
-| `SD_DAT1`    | GPIO4      | J2 Pin 1   | Data 1 (Also drives Flashlight LED via transistor) |
-| `SD_DAT2`    | GPIO12     | J1 Pin 4   | Data 2 (Strapping pin MTDI; has 10k pull-up) |
-| `SD_DAT3`    | GPIO13     | J1 Pin 5   | Data 3 (Card Detect / CS; has 10k pull-up) |
-
-**Recommended Mode:** **1-Bit SDMMC Mode**
-* Uses only `GPIO14` (CLK), `GPIO15` (CMD), and `GPIO2` (DAT0).
-* Frees up `GPIO4`, `GPIO12`, and `GPIO13` for general I/O or display control.
-* Throughput at 20-40 MHz is 2.5 to 5.0 MB/s (20-40 Mbps), which exceeds the bandwidth required for FLAC/WAV streaming (~0.17 to 0.5 MB/s) by more than 10x.
+### B. High-Power Flashlight LED & MOSFET Modification (GPIO 4)
+* **Flashlight LED:** Desoldered by the user.
+* **MOSFET Removal Recommendation:** **REMOVE (DESOLDER) THE MOSFET.**
+  * **Why:** The gate of the SOT-23 N-channel MOSFET driving the flashlight LED is directly connected to **GPIO 4**. It includes an on-board **10kΩ pull-down resistor to GND** and introduces parasitic gate capacitance (~50–100 pF).
+  * **Benefit of Removal:** Removing the 3-pin SOT-23 MOSFET (or clipping its gate pin) completely isolates GPIO 4, eliminating the 10kΩ pull-down load and gate capacitance.
+  * **Result:** **GPIO 4 becomes a 100% clean, standard GPIO** on the outer 2.54 mm header (J1 / Pin 8), ideal for:
+    * Nokia C1-01 Display Reset (`TFT_RST`)
+    * Display Backlight PWM brightness control (`TFT_BL`)
+    * User button or rotary encoder input
+    * Or future 4-bit SDMMC (`DAT1` with clean pull-up)
 
 ---
 
-### B. Nokia C1-01 Display Pin Assignment
+### C. On-Board MicroSD Card Slot
+The MicroSD card slot on the underside of the HW-297 PCB is routed to the ESP32 hardware SDMMC Host:
+
+| SDMMC Signal | ESP32 GPIO | Physical Pin | Notes |
+|:-------------|:-----------|:-------------|:------|
+| `SD_CLK`     | GPIO14     | J1 Pin 6     | Hardware SDMMC Clock line |
+| `SD_CMD`     | GPIO15     | J1 Pin 5     | Command/Response (Strapping pin MTDO; has 10k pull-up) |
+| `SD_DAT0`    | GPIO2      | J1 Pin 7     | Data 0 (Strapping pin; bootloader pull-down) |
+| `SD_DAT1`    | GPIO4      | J1 Pin 8     | Data 1 (Flashlight line; freed by removing LED/MOSFET) |
+| `SD_DAT2`    | GPIO12     | J1 Pin 3     | Data 2 (Strapping pin MTDI; must be LOW at boot) |
+| `SD_DAT3`    | GPIO13     | J1 Pin 4     | Data 3 (Card Detect / CS; has 10k pull-up) |
+
+**Active Operating Mode:** **1-Bit SDMMC Mode**
+* Uses only `GPIO14` (CLK), `GPIO15` (CMD), and `GPIO2` (DAT0).
+* Frees up `GPIO4`, `GPIO12`, and `GPIO13` for display and general I/O.
+
+---
+
+### D. Nokia C1-01 Display Pin Assignments & Options
 
 The Nokia C1-01 display uses a 9-bit SPI protocol (1 D/C bit + 8 data bits packed in software), requiring **no separate D/C pin** and **no MISO pin**. Only 4 lines are required:
 
 | Display Signal | Assigned GPIO | Physical Location | Bus / Peripheral Role |
 |:---------------|:--------------|:------------------|:----------------------|
-| `TFT_CS`       | GPIO5         | J2 Pin 5 (IO5)    | Hardware VSPI CS / General Output |
-| `TFT_SCK`      | GPIO18        | J2 Pin 6 (IO18)   | Hardware VSPI SCLK (Clock @ ~26 MHz) |
-| `TFT_MOSI`     | GPIO19        | J2 Pin 7 (IO19)   | Hardware VSPI MOSI (9-bit packed stream) |
-| `TFT_RST`      | GPIO13        | J1 Pin 5 (IO13)   | Active-low Display Reset (Freed by 1-bit SDMMC) |
+| `TFT_CS`       | **GPIO 5**    | Reclaimed Camera Y2 (FPC) | Hardware VSPI CS0 |
+| `TFT_SCK`      | **GPIO 18**   | Reclaimed Camera Y3 (FPC) | Hardware VSPI SCLK (~26 MHz) |
+| `TFT_MOSI`     | **GPIO 19**   | Reclaimed Camera Y4 (FPC) | Hardware VSPI MOSI (9-bit packed stream) |
+| `TFT_RST`      | **GPIO 4** *(or 13)* | J1 Pin 8 (Header) | Active-low Display Reset (Freed via LED/MOSFET mod) |
+| `TFT_BL`       | **GPIO 4** / 3.3V | J1 Pin 8 / 3.3V Rail | Backlight LED (Direct 3.3V or PWM control) |
 
-*Alternative Reset Pin:* If 4-bit SDMMC is preferred later, `TFT_RST` can be connected to reclaimed camera pin `GPIO26`, `GPIO27`, `GPIO21`, or `GPIO32`.
+*Alternative Reclaimed Camera Pins for Display / Controls:*
+* If avoiding the SDMMC pins entirely:
+  * `TFT_RST` can be assigned to **GPIO 21** (Camera PCLK), **GPIO 26** (Camera SIOD), or **GPIO 27** (Camera VSYNC).
+  * `TFT_CS` can be moved to **GPIO 25** or **GPIO 32** if desired.
 
 ---
 
-### C. Pin Allocation Summary Table
+### E. Pin Allocation Summary Table
 
-| GPIO | Default CAM Function | Audio Player Role | Status / Constraint |
-|:----:|:---------------------|:------------------|:--------------------|
-| 0    | Camera XCLK / Boot   | Bootloader Mode   | Strapping pin; must be HIGH to boot normally |
-| 1    | U0TXD                | UART Console TX   | Serial terminal & firmware flashing |
-| 2    | Camera / SD_DAT0     | SDMMC DAT0        | Must be LOW/floating at boot |
-| 3    | U0RXD                | UART Console RX   | Serial terminal & firmware flashing |
-| 4    | Flash LED / SD_DAT1  | Available / LED   | High-power flash LED line |
-| 5    | Camera Y2            | Display CS        | Hardware VSPI CS0 |
-| 12   | Camera Y9 / SD_DAT2  | Available GPIO    | Strapping pin MTDI (must be LOW at boot for 3.3V LDO) |
-| 13   | Camera / SD_DAT3     | Display RST       | Reset line for Nokia C1-01 LCD |
-| 14   | Camera / SD_CLK      | SDMMC CLK         | Clock line for on-board MicroSD |
-| 15   | Camera / SD_CMD      | SDMMC CMD         | Command line for on-board MicroSD |
-| 16   | PSRAM CS             | Dedicated PSRAM   | Connected to ESP_PSRAM64H (Do not use externally) |
-| 17   | PSRAM CLK            | Dedicated PSRAM   | Connected to ESP_PSRAM64H (Do not use externally) |
-| 18   | Camera Y3            | Display SCK       | Hardware VSPI SCLK |
-| 19   | Camera Y4            | Display MOSI      | Hardware VSPI MOSI |
-| 21   | Camera PCLK          | User Button / Enc | Reclaimed camera pad |
-| 22   | Camera (Internal)    | User Button / Enc | Reclaimed camera pad |
-| 23   | Camera (Internal)    | User Button / Enc | Reclaimed camera pad |
-| 25   | Camera HREF          | Available GPIO    | Reclaimed camera pad |
-| 26   | Camera SIOD          | Available GPIO    | Reclaimed camera pad |
-| 27   | Camera VSYNC         | Available GPIO    | Reclaimed camera pad |
-| 32   | Camera XCLK          | Available GPIO    | Reclaimed camera pad |
-| 33   | Small Status LED     | System Status LED | Inverted active-low onboard indicator |
-| 34   | Camera Y7            | Button Input      | Input-only pin (requires external pull-up) |
-| 35   | Camera Y8            | Button Input      | Input-only pin (requires external pull-up) |
-| 36   | Camera Y5 (VP)       | Button Input      | Input-only pin (requires external pull-up) |
-| 39   | Camera Y6 (VN)       | Button Input      | Input-only pin (requires external pull-up) |
+| GPIO | Default CAM Function | Audio Player Role | Physical Location | Status / Constraint |
+|:----:|:---------------------|:------------------|:------------------|:--------------------|
+| 0    | Camera XCLK / Boot   | Bootloader Mode   | Outer Header J2   | Strapping pin; must be HIGH to boot normally |
+| 1    | U0TXD                | UART Console TX   | Outer Header J2   | Serial terminal & firmware flashing |
+| 2    | Camera / SD_DAT0     | SDMMC DAT0        | Outer Header J1   | Must be LOW/floating at boot |
+| 3    | U0RXD                | UART Console RX   | Outer Header J2   | Serial terminal & firmware flashing |
+| 4    | Flash LED / SD_DAT1  | **Display RST / BL** | Outer Header J1 | Clean GPIO after removing LED & MOSFET |
+| 5    | Camera Y2            | **Display CS**    | Reclaimed CAM FPC | Hardware VSPI CS0 |
+| 12   | Camera Y9 / SD_DAT2  | Available GPIO    | Outer Header J1   | Strapping pin MTDI (must be LOW at boot) |
+| 13   | Camera / SD_DAT3     | Available / RST   | Outer Header J1   | Freed in 1-bit SD mode |
+| 14   | Camera / SD_CLK      | SDMMC CLK         | Outer Header J1   | Clock line for on-board MicroSD |
+| 15   | Camera / SD_CMD      | SDMMC CMD         | Outer Header J1   | Command line for on-board MicroSD |
+| 16   | PSRAM CS             | Dedicated PSRAM   | Internal Module   | Connected to ESP_PSRAM64H (DO NOT USE) |
+| 17   | PSRAM CLK            | Dedicated PSRAM   | Internal Module   | Connected to ESP_PSRAM64H (DO NOT USE) |
+| 18   | Camera Y3            | **Display SCK**   | Reclaimed CAM FPC | Hardware VSPI SCLK |
+| 19   | Camera Y4            | **Display MOSI**  | Reclaimed CAM FPC | Hardware VSPI MOSI |
+| 21   | Camera PCLK          | User Button / Enc | Reclaimed CAM FPC | Reclaimed general output/input |
+| 22   | Camera (Internal)    | User Button / Enc | Reclaimed CAM FPC | Reclaimed general output/input |
+| 23   | Camera (Internal)    | User Button / Enc | Reclaimed CAM FPC | Reclaimed general output/input |
+| 25   | Camera HREF          | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
+| 26   | Camera SIOD          | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
+| 27   | Camera VSYNC         | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
+| 32   | Camera XCLK          | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
+| 33   | Small Status LED     | System Status LED | Onboard Red LED   | Inverted active-low indicator |
+| 34   | Camera Y7            | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
+| 35   | Camera Y8            | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
+| 36   | Camera Y5 (VP)       | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
+| 39   | Camera Y6 (VN)       | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
 
 ---
 
