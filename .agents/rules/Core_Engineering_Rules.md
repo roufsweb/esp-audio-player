@@ -28,3 +28,9 @@ These rules govern all engineering, development, and documentation work on this 
 - Whenever any feature is added, modified, optimized, or verified, update `README.md` and `FEATURES.md` in the exact same step.
 - Document all user-facing console commands, format capabilities, bitrates, buffer allocations, and architectural decisions.
 - Maintain a clear status log of verified working features vs planned items.
+
+## 6. Implementation Plan & Discussion First (Mandatory Before Hardware Changes or Big Modifications)
+- Always create a detailed implementation plan and technical discussion BEFORE making any hardware pin reassignments, physical wiring modifications, peripheral mode switches (e.g. 1-bit vs 4-bit SDMMC), or major architectural changes.
+- Clearly present the circuit implications, signal conflicts, timing constraints, and verification steps in the plan first.
+- STOP and obtain explicit user alignment and approval on the implementation plan before executing code changes or modifying hardware configurations.
+
