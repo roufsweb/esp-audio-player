@@ -30,6 +30,16 @@ CONFIG_HTTPD_MAX_URI_LEN=512
 # CPU: run at 240 MHz for FLAC decode headroom
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
+# FreeRTOS tick rate: 1000Hz = 1ms resolution
+# Default 100Hz (10ms ticks) causes timing problems:
+#   - pdMS_TO_TICKS(5) rounds to 0 (no wait at all)
+#   - Pre-buffer 300x10ms = 3s blocks console task near TWDT limit
+#   - BT ACL scheduler misses 20ms timing windows causing disconnects
+CONFIG_FREERTOS_HZ=1000
+
+# Task Watchdog: 10s timeout (large FLAC metadata parse can take 2-3s)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
 # Flash Size (4MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 

@@ -63,18 +63,27 @@
 #define BTA_AV_CO_SBC_MIN_BITPOOL_OFF  5
 #define BTA_AV_CO_SBC_MAX_BITPOOL_OFF  6
 
-#define BTA_AV_CO_SBC_MAX_BITPOOL  250 /* Modified for SBC XQ (originally 53) */
+#define BTA_AV_CO_SBC_MAX_BITPOOL  250 /* Max bitpool negotiation ceiling */
+
+/* Bitpool targets for each mode:
+ * Dual Channel (SBC XQ):  bitpool 38 → ~452 kbps @ 44.1k, ~492 kbps @ 48k
+ * Joint Stereo (standard): bitpool 53 → ~328 kbps @ 44.1k, ~345 kbps @ 48k */
+#define BTA_AV_CO_SBC_BITPOOL_DUAL   38
+#define BTA_AV_CO_SBC_BITPOOL_JOINT  53
 
 /* SCMS-T protect info */
 const UINT8 bta_av_co_cp_scmst[BTA_AV_CP_INFO_LEN] = "\x02\x02\x00";
 
-/* SBC SRC codec capabilities */
+/* SBC SRC codec capabilities — advertise full A2DP-compliant baseline so
+ * every sink (Dual-Channel, Joint-Stereo, 44.1k-only, 48k-only) can connect.
+ * Adaptive negotiation in bta_av_co_audio_codec_build_config() picks the
+ * highest quality mode the specific sink actually supports. */
 const tA2D_SBC_CIE bta_av_co_sbc_caps = {
-    (A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
-    (A2D_SBC_IE_CH_MD_DUAL), /* ch_mode - forced for SBC XQ */
-    (A2D_SBC_IE_BLOCKS_16), /* block_len - forced for SBC XQ */
-    (A2D_SBC_IE_SUBBAND_8), /* num_subbands - forced for SBC XQ */
-    (A2D_SBC_IE_ALLOC_MD_L), /* alloc_mthd */
+    (A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq: advertise both */
+    (A2D_SBC_IE_CH_MD_DUAL | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_STEREO), /* ch_mode: all stereo modes */
+    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4),
+    (A2D_SBC_IE_SUBBAND_8 | A2D_SBC_IE_SUBBAND_4),
+    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S),
     BTA_AV_CO_SBC_MAX_BITPOOL, /* max_bitpool */
     A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
 };
@@ -94,15 +103,16 @@ const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
 #define BTC_AV_SBC_DEFAULT_SAMP_FREQ A2D_SBC_IE_SAMP_FREQ_44
 #endif
 
-/* Default SBC codec configuration */
+/* Default SBC codec configuration — Joint Stereo is the universal fallback
+ * supported by virtually all A2DP sinks. Bitpool 53 = standard maximum. */
 const tA2D_SBC_CIE btc_av_sbc_default_config = {
-    BTC_AV_SBC_DEFAULT_SAMP_FREQ,   /* samp_freq */
-    A2D_SBC_IE_CH_MD_JOINT,         /* ch_mode */
-    A2D_SBC_IE_BLOCKS_16,           /* block_len */
-    A2D_SBC_IE_SUBBAND_8,           /* num_subbands */
-    A2D_SBC_IE_ALLOC_MD_L,          /* alloc_mthd */
-    BTA_AV_CO_SBC_MAX_BITPOOL,      /* max_bitpool */
-    A2D_SBC_IE_MIN_BITPOOL          /* min_bitpool */
+    BTC_AV_SBC_DEFAULT_SAMP_FREQ,       /* samp_freq */
+    A2D_SBC_IE_CH_MD_JOINT,             /* ch_mode: safe default for all sinks */
+    A2D_SBC_IE_BLOCKS_16,               /* block_len */
+    A2D_SBC_IE_SUBBAND_8,               /* num_subbands */
+    A2D_SBC_IE_ALLOC_MD_L,              /* alloc_mthd */
+    BTA_AV_CO_SBC_BITPOOL_JOINT,        /* max_bitpool: standard 53 default */
+    A2D_SBC_IE_MIN_BITPOOL              /* min_bitpool */
 };
 
 /* Control block instance */
@@ -111,6 +121,23 @@ tBTA_AV_CO_CB bta_av_co_cb;
 #else
 tBTA_AV_CO_CB *bta_av_co_cb_ptr;
 #endif
+
+/* Active negotiated A2DP Codec Telemetry */
+typedef struct {
+    char codec_name[32];
+    UINT32 sample_rate;
+    UINT8 bitpool;
+    UINT32 bitrate_kbps;
+    BOOLEAN valid;
+} bta_av_active_codec_info_t;
+
+static bta_av_active_codec_info_t s_active_codec_info = {
+    .codec_name = "None",
+    .sample_rate = 0,
+    .bitpool = 0,
+    .bitrate_kbps = 0,
+    .valid = FALSE
+};
 
 static BOOLEAN bta_av_co_audio_codec_build_config(const UINT8 *p_codec_caps, UINT8 *p_codec_cfg);
 static void bta_av_co_audio_peer_reset_config(tBTA_AV_CO_PEER *p_peer);
@@ -894,6 +921,13 @@ void bta_av_co_audio_close(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT16 m
 
     /* reset remote preference through setconfig */
     bta_av_co_cb.codec_cfg_setconfig.id = BTC_AV_CODEC_NONE;
+
+    /* Reset active codec telemetry */
+    s_active_codec_info.valid = FALSE;
+    strncpy(s_active_codec_info.codec_name, "None", sizeof(s_active_codec_info.codec_name) - 1);
+    s_active_codec_info.sample_rate = 0;
+    s_active_codec_info.bitpool = 0;
+    s_active_codec_info.bitrate_kbps = 0;
 }
 
 /*******************************************************************************
@@ -1056,19 +1090,109 @@ static BOOLEAN bta_av_co_audio_codec_build_config(const UINT8 *p_codec_caps, UIN
     memset(p_codec_cfg, 0, AVDT_CODEC_SIZE);
 
     switch (bta_av_co_cb.codec_cfg.id) {
-    case BTC_AV_CODEC_SBC:
-        /*  only copy the relevant portions for this codec to avoid issues when
-            comparing codec configs covering larger codec sets than SBC (7 bytes) */
+    case BTC_AV_CODEC_SBC: {
+        /* Copy base codec config bytes (type, version, freq+chan, block+band, bitpool range) */
         memcpy(p_codec_cfg, bta_av_co_cb.codec_cfg.info, BTA_AV_CO_SBC_MAX_BITPOOL_OFF + 1);
 
-        /* Update the bit pool boundaries with the codec capabilities */
-        p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF] = p_codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF];
-        p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] = p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF];
+        /* ----------------------------------------------------------------
+         * Adaptive sample rate selection:
+         *   Prefer 48 kHz — exact 2:1 integer decimation from 96 kHz source,
+         *   zero fractional resampler overhead. Fall back to 44.1 kHz.
+         * FREQ_CHAN byte = caps[3]: upper nibble = freq bits, lower nibble = chan bits.
+         * ---------------------------------------------------------------- */
+        UINT8 sink_freq_chan = p_codec_caps[BTA_AV_CO_SBC_FREQ_CHAN_OFF];
+        UINT8 cur_freq_chan  = p_codec_cfg[BTA_AV_CO_SBC_FREQ_CHAN_OFF];
 
-        APPL_TRACE_EVENT("bta_av_co_audio_codec_build_config : bitpool min %d, max %d",
-                         p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
-                         p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF]);
+        /* Determine negotiated sample rate:
+         * Prefer 44.1 kHz because btc_a2dp_source natively feeds at 44.1 kHz,
+         * avoiding Bluedroid's internal software up-sampler. Fall back to 48 kHz
+         * for 48k-only sinks. */
+        extern void audio_player_set_negotiated_rate(uint32_t rate_hz);
+        if (sink_freq_chan & A2D_SBC_IE_SAMP_FREQ_44) {
+            cur_freq_chan = (cur_freq_chan & ~(A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44
+                                              | A2D_SBC_IE_SAMP_FREQ_32 | A2D_SBC_IE_SAMP_FREQ_16))
+                            | A2D_SBC_IE_SAMP_FREQ_44;
+            APPL_TRACE_DEBUG("bta_av_co_audio_codec_build_config: selected 44.1 kHz");
+            audio_player_set_negotiated_rate(44100);
+        } else if (sink_freq_chan & A2D_SBC_IE_SAMP_FREQ_48) {
+            cur_freq_chan = (cur_freq_chan & ~(A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44
+                                              | A2D_SBC_IE_SAMP_FREQ_32 | A2D_SBC_IE_SAMP_FREQ_16))
+                            | A2D_SBC_IE_SAMP_FREQ_48;
+            APPL_TRACE_DEBUG("bta_av_co_audio_codec_build_config: selected 48 kHz");
+            audio_player_set_negotiated_rate(48000);
+        }
+
+        /* ----------------------------------------------------------------
+         * Adaptive channel mode selection:
+         *   Priority: Dual Channel (SBC XQ) > Joint Stereo > Stereo
+         *   Dual Channel allows per-channel independent bit allocation,
+         *   enabling ~452-492 kbps at standard bitpool 38.
+         * ---------------------------------------------------------------- */
+        UINT8 target_ch_mode;
+        UINT8 target_bitpool;
+        if (sink_freq_chan & A2D_SBC_IE_CH_MD_DUAL) {
+            target_ch_mode  = A2D_SBC_IE_CH_MD_DUAL;
+            target_bitpool  = BTA_AV_CO_SBC_BITPOOL_DUAL;
+            APPL_TRACE_DEBUG("bta_av_co_audio_codec_build_config: Dual Channel (SBC XQ), bitpool=%d", target_bitpool);
+        } else if (sink_freq_chan & A2D_SBC_IE_CH_MD_JOINT) {
+            target_ch_mode  = A2D_SBC_IE_CH_MD_JOINT;
+            target_bitpool  = BTA_AV_CO_SBC_BITPOOL_JOINT;
+            APPL_TRACE_DEBUG("bta_av_co_audio_codec_build_config: Joint Stereo, bitpool=%d", target_bitpool);
+        } else {
+            target_ch_mode  = A2D_SBC_IE_CH_MD_STEREO;
+            target_bitpool  = BTA_AV_CO_SBC_BITPOOL_JOINT;
+            APPL_TRACE_DEBUG("bta_av_co_audio_codec_build_config: Stereo, bitpool=%d", target_bitpool);
+        }
+
+        /* Write back resolved freq+chan byte (channel mode in lower nibble) */
+        cur_freq_chan = (cur_freq_chan & ~(A2D_SBC_IE_CH_MD_DUAL | A2D_SBC_IE_CH_MD_JOINT
+                                          | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_MONO))
+                        | target_ch_mode;
+        p_codec_cfg[BTA_AV_CO_SBC_FREQ_CHAN_OFF] = cur_freq_chan;
+
+        /* Clamp bitpool to what the sink will actually accept */
+        UINT8 sink_max_bp = p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF];
+        UINT8 sink_min_bp = p_codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF];
+        UINT8 chosen_bp   = (target_bitpool < sink_max_bp) ? target_bitpool : sink_max_bp;
+        if (chosen_bp < sink_min_bp) chosen_bp = sink_min_bp;
+
+        p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF] = sink_min_bp;
+        p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] = chosen_bp;
+
+        /* Record active codec telemetry with mathematically exact A2DP bitrate */
+        uint32_t sbc_rate = (cur_freq_chan & A2D_SBC_IE_SAMP_FREQ_44) ? 44100 : 48000;
+        s_active_codec_info.sample_rate = sbc_rate;
+        s_active_codec_info.bitpool = chosen_bp;
+        s_active_codec_info.valid = TRUE;
+
+        if (target_ch_mode == A2D_SBC_IE_CH_MD_DUAL) {
+            strncpy(s_active_codec_info.codec_name, "SBC XQ (Dual Ch)", sizeof(s_active_codec_info.codec_name) - 1);
+            /* Dual Channel (16 blocks, 8 subbands, 2 channels):
+             * frame_len = 4 + (4*8*2)/8 + (16*2*bitpool)/8 = 12 + 4 * bitpool
+             * Bitrate = (frame_len * rate) / 16000 */
+            uint32_t frame_len = 12 + 4 * (uint32_t)chosen_bp;
+            s_active_codec_info.bitrate_kbps = (frame_len * sbc_rate) / 16000;
+        } else if (target_ch_mode == A2D_SBC_IE_CH_MD_JOINT) {
+            strncpy(s_active_codec_info.codec_name, "SBC (Joint Stereo)", sizeof(s_active_codec_info.codec_name) - 1);
+            /* Joint Stereo (16 blocks, 8 subbands, 2 channels):
+             * frame_len = 4 + (4*8*2)/8 + ceil((8 + 16*bitpool)/8) = 12 + (8 + 16*bitpool + 7)/8 = 13 + 2 * bitpool
+             * Bitrate = (frame_len * rate) / 16000 */
+            uint32_t frame_len = 13 + 2 * (uint32_t)chosen_bp;
+            s_active_codec_info.bitrate_kbps = (frame_len * sbc_rate) / 16000;
+        } else if (target_ch_mode == A2D_SBC_IE_CH_MD_STEREO) {
+            strncpy(s_active_codec_info.codec_name, "SBC (Stereo)", sizeof(s_active_codec_info.codec_name) - 1);
+            uint32_t frame_len = 12 + 2 * (uint32_t)chosen_bp;
+            s_active_codec_info.bitrate_kbps = (frame_len * sbc_rate) / 16000;
+        } else {
+            strncpy(s_active_codec_info.codec_name, "SBC (Mono)", sizeof(s_active_codec_info.codec_name) - 1);
+            uint32_t frame_len = 8 + (uint32_t)chosen_bp;
+            s_active_codec_info.bitrate_kbps = (frame_len * sbc_rate) / 16000;
+        }
+
+        APPL_TRACE_EVENT("bta_av_co_audio_codec_build_config: bitpool min=%d chosen=%d (sink_max=%d) -> %s @ %lu kbps",
+                         sink_min_bp, chosen_bp, sink_max_bp, s_active_codec_info.codec_name, (unsigned long)s_active_codec_info.bitrate_kbps);
         break;
+    }
     default:
         APPL_TRACE_ERROR("bta_av_co_audio_codec_build_config: unsupported codec id %d", bta_av_co_cb.codec_cfg.id);
         return FALSE;
@@ -1744,6 +1868,18 @@ BOOLEAN bta_av_co_get_remote_bitpool_pref(UINT8 *min, UINT8 *max)
     *max = bta_av_co_cb.codec_cfg_setconfig.info[BTA_AV_CO_SBC_MAX_BITPOOL_OFF];
 
     return TRUE;
+}
+
+BOOLEAN bta_av_co_get_active_codec_info(char *codec_name, size_t max_name_len, UINT32 *rate, UINT32 *bitrate_kbps, UINT8 *bitpool)
+{
+    if (codec_name && max_name_len > 0) {
+        strncpy(codec_name, s_active_codec_info.valid ? s_active_codec_info.codec_name : "None", max_name_len - 1);
+        codec_name[max_name_len - 1] = '\0';
+    }
+    if (rate) *rate = s_active_codec_info.sample_rate;
+    if (bitrate_kbps) *bitrate_kbps = s_active_codec_info.bitrate_kbps;
+    if (bitpool) *bitpool = s_active_codec_info.bitpool;
+    return s_active_codec_info.valid;
 }
 
 /* the call out functions for audio stream */

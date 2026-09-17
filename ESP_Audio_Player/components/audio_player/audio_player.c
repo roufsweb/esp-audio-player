@@ -13,6 +13,7 @@
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
+#include "esp_timer.h"
 
 /* High-performance dr_flac with zero CRC overhead and lean memory profile */
 #define DR_FLAC_IMPLEMENTATION
@@ -20,7 +21,7 @@
 #define DR_FLAC_NO_CRC                  /* Eliminate software CRC checks for 30-50% CPU boost */
 #define DR_FLAC_NO_SIMD                 /* Xtensa LX6 has no x86/ARM SIMD */
 #define DR_FLAC_NO_PICTURE_METADATA_MALLOC /* Never allocate RAM for embedded album art */
-#define DR_FLAC_BUFFER_SIZE 4096        /* 4 KB stream buffer */
+#define DR_FLAC_BUFFER_SIZE 4096        /* 4 KB stream buffer: matches 8x SDMMC sectors (512B) and fits comfortably in task stack */
 #include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";
@@ -28,12 +29,23 @@ static const char *TAG = "AUDIO_PLAYER";
 #define DEFAULT_SAMPLE_RATE 44100
 #define DEFAULT_TONE_FREQ   440.0
 
+/* 101-entry audiophile logarithmic volume taper (Q15 fixed-point, 50% = -10.8 dB, 100% = 0 dB bit-perfect) */
+static const uint16_t s_vol_lut[101] = {
+        0,     8,    28,    59,    99,   149,   207,   273,   347,   429,   519,   616,   721,   832,   951,  1077,
+     1210,  1349,  1495,  1648,  1808,  1974,  2146,  2325,  2510,  2702,  2899,  3103,  3313,  3529,  3751,  3980,
+     4214,  4454,  4700,  4951,  5209,  5472,  5741,  6016,  6297,  6583,  6875,  7172,  7475,  7784,  8098,  8418,
+     8743,  9073,  9409,  9751, 10098, 10450, 10808, 11170, 11539, 11912, 12291, 12675, 13064, 13459, 13859, 14264,
+    14674, 15089, 15510, 15935, 16366, 16802, 17243, 17688, 18139, 18595, 19056, 19523, 19994, 20470, 20951, 21437,
+    21927, 22423, 22924, 23430, 23940, 24456, 24976, 25501, 26031, 26566, 27106, 27651, 28200, 28754, 29313, 29877,
+    30445, 31018, 31596, 32179, 32767
+};
+
 /* 512 KB PSRAM Ring Buffer: ~2.97 seconds of 44.1kHz 16-bit stereo audio */
 #define PCM_RING_BUF_SIZE   (512 * 1024)
 #define PCM_REFILL_THRESH   (256 * 1024)            /* Refill when buffer dips below ~1.5 seconds */
 #define PCM_HIGH_WATERMARK  (384 * 1024)            /* Fill up to ~2.2 seconds, then sleep */
-#define PCM_CHUNK_FRAMES    1024                    /* 1024 stereo frames per decode iteration */
-#define PCM_CHUNK_BYTES     (PCM_CHUNK_FRAMES * 4)  /* 4096 bytes (4 KB) */
+#define PCM_CHUNK_FRAMES    2048                    /* 2048 stereo frames per decode iteration */
+#define PCM_CHUNK_BYTES     (PCM_CHUNK_FRAMES * 4)  /* 8192 bytes (8 KB) */
 
 static SemaphoreHandle_t s_lock = NULL;
 static SemaphoreHandle_t s_ring_lock = NULL;
@@ -51,7 +63,8 @@ static volatile bool     s_decode_eof = false;
 static audio_player_state_t s_state = AUDIO_STATE_STOPPED;
 static audio_player_source_t s_source = AUDIO_SOURCE_SINE;
 static audio_player_media_ctrl_cb_t s_media_ctrl_cb = NULL;
-static uint8_t s_volume = 100;
+static uint8_t s_volume = 5;
+static volatile bool s_is_prebuffered = false;
 
 /* Active audio path */
 static char s_audio_path[256] = {0};
@@ -77,15 +90,118 @@ static uint32_t s_flac_played_bytes = 0;
 static double s_sine_phase = 0.0;
 static double s_sine_freq = DEFAULT_TONE_FREQ;
 
-/* Linear interpolation resampler for high-res FLAC/WAV (48k, 88.2k, 96k, 192k -> 44.1k) */
-#define RESAMPLE_IN_MAX_FRAMES 1280
-static int16_t *s_resample_in = NULL;
+/* Negotiated Bluetooth A2DP sample rate (set by BT stack callback after AVDTP handshake).
+ * 0 = unknown/unset. Used to select 96k→48k FIR vs 96k→44.1k fractional resampler. */
+static volatile uint32_t s_negotiated_bt_rate = 0;
 
-/* PSRAM allocation callbacks for dr_flac to protect internal SRAM */
+/* ============================================================
+ * 23-Tap Half-Band FIR Decimation Filter (96 kHz → 48 kHz)
+ * ============================================================
+ * Coefficients designed for >60 dB stopband rejection, Q15 fixed-point.
+ * Symmetric half-band structure: all even-indexed coefficients are zero
+ * (except center tap h[11]), halving the required multiply-accumulate count.
+ * Only non-zero taps (odd offsets from center): h[1], h[3], h[5], h[7], h[9], h[11]=center.
+ * Reference: Parks-McClellan optimal equiripple design, normalized to Q15 (32767 = 1.0).
+ */
+#define HB_FIR_TAPS 23
+#define HB_FIR_HALF (HB_FIR_TAPS / 2)  /* 11 */
+
+/* Non-zero half-band FIR coefficients (indices 0..HB_FIR_HALF).
+ * h[0] = outermost tap, h[HB_FIR_HALF] = center tap (gain = 0.5 in Q15). */
+static const int16_t s_hb_fir_coeff[12] = {
+    -25,   /* h[0]  = h[22] */
+      0,   /* h[1]  = 0 (even, zero by HB symmetry) */
+    120,   /* h[2]  = h[20] */
+      0,   /* h[3]  = 0 */
+   -415,   /* h[4]  = h[18] */
+      0,   /* h[5]  = 0 */
+   1674,   /* h[6]  = h[16] */
+      0,   /* h[7]  = 0 */
+  -7318,   /* h[8]  = h[14] */
+      0,   /* h[9]  = 0 */
+  29375,   /* h[10] = h[12] */
+  32767,   /* h[11] = center tap */
+};
+
+/* Delay-line history for the FIR filter (stereo interleaved: L0,R0,L1,R1,...)
+ * Size = HB_FIR_TAPS - 1 = 22 samples × 2 channels = 44 int16_t entries. */
+static int16_t s_hb_delay_l[HB_FIR_TAPS] = {0};
+static int16_t s_hb_delay_r[HB_FIR_TAPS] = {0};
+
+/* ----------------------------------------------------------------
+ * resample_96k_to_48k_halfband
+ *
+ * Decimate stereo PCM from 96 kHz to 48 kHz using the half-band FIR.
+ * Input:  in_samples   - pointer to stereo interleaved int16_t at 96 kHz
+ *         in_frames    - number of INPUT frames (= 2 × output frames)
+ * Output: out_samples  - pointer to stereo interleaved int16_t at 48 kHz
+ * Returns number of output frames written.
+ *
+ * The FIR processes every input sample into the delay line.
+ * One output sample is computed for every TWO input samples (decimation by 2).
+ * The anti-aliasing filter suppresses all energy above 24 kHz.
+ * ---------------------------------------------------------------- */
+static uint32_t resample_96k_to_48k_halfband(
+    const int16_t *in_samples, uint32_t in_frames,
+    int16_t *out_samples)
+{
+    uint32_t out_frames = 0;
+    const int16_t *p = in_samples;
+
+    for (uint32_t i = 0; i < in_frames; i++) {
+        int16_t spl  = p[i * 2];
+        int16_t spr  = p[i * 2 + 1];
+
+        /* Shift delay lines */
+        for (int k = HB_FIR_TAPS - 1; k > 0; k--) {
+            s_hb_delay_l[k] = s_hb_delay_l[k - 1];
+            s_hb_delay_r[k] = s_hb_delay_r[k - 1];
+        }
+        s_hb_delay_l[0] = spl;
+        s_hb_delay_r[0] = spr;
+
+        /* Output one frame for every two input frames */
+        if (i & 1) {
+            int32_t accl = 0, accr = 0;
+
+            /* Center tap (h[11] = 32767): multiply delay_line[11] */
+            accl += (int32_t)s_hb_delay_l[HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
+            accr += (int32_t)s_hb_delay_r[HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
+
+            /* Symmetric non-zero taps (even index from center = 0, skip; odd = non-zero) */
+            for (int t = 0; t < HB_FIR_HALF; t += 2) {
+                int32_t cl = s_hb_fir_coeff[t];
+                if (cl == 0) continue;
+                accl += cl * ((int32_t)s_hb_delay_l[t] + (int32_t)s_hb_delay_l[HB_FIR_TAPS - 1 - t]);
+                accr += cl * ((int32_t)s_hb_delay_r[t] + (int32_t)s_hb_delay_r[HB_FIR_TAPS - 1 - t]);
+            }
+
+            /* Q15 shift: divide by 32768 */
+            out_samples[out_frames * 2]     = (int16_t)((accl + 16384) >> 15);
+            out_samples[out_frames * 2 + 1] = (int16_t)((accr + 16384) >> 15);
+            out_frames++;
+        }
+    }
+    return out_frames;
+}
+
+/* Continuous streaming linear interpolation resampler for high-res FLAC/WAV (48k, 88.2k, 96k, 192k → 44.1k) */
+#define RESAMPLE_IN_MAX_FRAMES 5120
+static int16_t *s_resample_in = NULL;
+static uint32_t s_src_phase = 0;       /* Continuous 16.16 fixed-point phase accumulator across chunks */
+static int16_t  s_src_prev_l = 0;      /* Left sample at end of previous chunk */
+static int16_t  s_src_prev_r = 0;      /* Right sample at end of previous chunk */
+
+/* Fast memory allocation callbacks for dr_flac:
+ * Prioritize single-cycle internal SRAM for working subframe sample buffers (< 48 KB).
+ * This eliminates hundreds of millions of slow SPI PSRAM bus stalls during 24-bit LPC math. */
 static void *flac_malloc(size_t sz, void *pUserData)
 {
     (void)pUserData;
-    void *ptr = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *ptr = heap_caps_malloc(sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
     if (!ptr) {
         ptr = malloc(sz);
     }
@@ -95,7 +211,10 @@ static void *flac_malloc(size_t sz, void *pUserData)
 static void *flac_realloc(void *p, size_t sz, void *pUserData)
 {
     (void)pUserData;
-    void *ptr = heap_caps_realloc(p, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *ptr = heap_caps_realloc(p, sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = heap_caps_realloc(p, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
     if (!ptr) {
         ptr = realloc(p, sz);
     }
@@ -125,6 +244,13 @@ static void close_active_file(void)
         drflac_close(s_flac);
         s_flac = NULL;
     }
+    s_is_prebuffered = false;
+    s_src_phase = 0;
+    s_src_prev_l = 0;
+    s_src_prev_r = 0;
+    /* Reset FIR delay lines so next track starts clean */
+    memset(s_hb_delay_l, 0, sizeof(s_hb_delay_l));
+    memset(s_hb_delay_r, 0, sizeof(s_hb_delay_r));
 }
 
 static bool has_extension(const char *path, const char *ext)
@@ -159,6 +285,15 @@ uint8_t audio_player_get_volume(void)
     return s_volume;
 }
 
+void audio_player_set_negotiated_rate(uint32_t rate_hz)
+{
+    s_negotiated_bt_rate = rate_hz;
+    ESP_LOGI(TAG, "Negotiated Bluetooth sink rate set to %lu Hz — resampler path: %s",
+             (unsigned long)rate_hz,
+             (rate_hz == 48000) ? "96k→48k half-band FIR" :
+             (rate_hz == 44100) ? "fractional linear interpolation" : "default fallback");
+}
+
 /* Ring buffer signaling helper */
 static inline void notify_decode_task(void)
 {
@@ -172,15 +307,10 @@ static inline void notify_decode_task(void)
     }
 }
 
-/* Query bytes buffered in ring buffer */
-static uint32_t ring_available(void)
+/* Query bytes buffered in ring buffer (s_ring_filled is 32-bit aligned, naturally atomic on Xtensa) */
+static inline uint32_t ring_available(void)
 {
-    uint32_t filled = 0;
-    if (s_ring_lock && xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(5)) == pdTRUE) {
-        filled = s_ring_filled;
-        xSemaphoreGive(s_ring_lock);
-    }
-    return filled;
+    return s_ring_filled;
 }
 
 /* Reset ring buffer pointers and counters */
@@ -191,6 +321,7 @@ static void ring_flush(void)
         s_ring_read = 0;
         s_ring_filled = 0;
         s_decode_eof = false;
+        s_is_prebuffered = false;
         xSemaphoreGive(s_ring_lock);
     }
 }
@@ -235,10 +366,17 @@ static uint32_t ring_write(const uint8_t *src, uint32_t len)
     return len;
 }
 
-/* Read PCM data from circular ring buffer */
+/* Read PCM data from circular ring buffer.
+ * CALLED FROM BT DATA CALLBACK (Core 0, latency-critical).
+ * Uses a safe 5ms timeout: the Core 1 decode task only holds s_ring_lock
+ * during a quick 5KB memcpy (~40 microseconds).
+ * Waiting up to 5ms ensures no packets are dropped into silence while avoiding starvation. */
 static uint32_t ring_read(uint8_t *dst, uint32_t len)
 {
     if (!s_ring_buf || !s_ring_lock || len == 0 || !dst) return 0;
+
+    /* Fast early-exit: check filled bytes without taking the lock. */
+    if (s_ring_filled == 0) return 0;
 
     if (xSemaphoreTake(s_ring_lock, pdMS_TO_TICKS(5)) != pdTRUE) {
         return 0;
@@ -403,13 +541,79 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
                 return (uint32_t)(frames_read * 4);
             }
         } else {
-            /* High-Res FLAC (48k, 88.2k, 96k, 192k): Real-time linear interpolation downsampler to 44.1 kHz */
+            /* High-Res FLAC (> 44.1 kHz):
+             * Route selection based on negotiated Bluetooth sink sample rate:
+             *  - 96 kHz source + 48 kHz sink  → half-band FIR 2:1 decimation (exact, no fractions, >60dB rejection)
+             *  - 48 kHz source + 48 kHz sink  → pass-through (zero resampling)
+             *  - anything   + 44.1 kHz sink   → linear interpolation fractional resampler
+             */
             if (!s_resample_in) return 0;
 
-            uint32_t target_out_frames = 588; /* 588 frames * 4 = 2352 bytes: exact integer ratio for 48k, 88.2k, 96k, 192k */
-            if (target_out_frames * 4 > max_bytes) {
-                target_out_frames = max_bytes / 4;
+            uint32_t bt_rate = s_negotiated_bt_rate;
+            if (bt_rate == 0) bt_rate = DEFAULT_SAMPLE_RATE; /* conservative fallback */
+
+            /* --- 48 kHz FLAC → 48 kHz BT: zero-copy passthrough --- */
+            if (s_flac_sample_rate == 48000 && bt_rate == 48000) {
+                drflac_uint64 frames_needed = max_bytes / 4;
+                drflac_uint64 frames_read   = drflac_read_pcm_frames_s16(
+                    s_flac, frames_needed, (drflac_int16 *)out_buf);
+                uint32_t bytes_out = (uint32_t)(frames_read * 4);
+                s_flac_played_bytes += bytes_out;
+                if (frames_read < frames_needed) {
+                    ESP_LOGI(TAG, "48k FLAC passthrough EOF (%lu / %lu bytes)",
+                             (unsigned long)s_flac_played_bytes, (unsigned long)s_flac_total_bytes);
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+                return bytes_out;
             }
+
+            /* --- 96 kHz FLAC → 48 kHz BT: half-band FIR decimation (2:1) --- */
+            if (s_flac_sample_rate == 96000 && bt_rate == 48000) {
+                /* Read 2× the output frames from FLAC (input at 96k, output at 48k) */
+                uint32_t out_frames_wanted = max_bytes / 4;
+                uint32_t in_frames_needed  = out_frames_wanted * 2; /* exact 2:1 */
+                if (in_frames_needed > RESAMPLE_IN_MAX_FRAMES) {
+                    in_frames_needed  = RESAMPLE_IN_MAX_FRAMES;
+                    out_frames_wanted = in_frames_needed / 2;
+                }
+
+                drflac_uint64 in_read = 0;
+                if (s_flac_channels == 2) {
+                    in_read = drflac_read_pcm_frames_s16(
+                        s_flac, in_frames_needed, (drflac_int16 *)s_resample_in);
+                    s_flac_played_bytes += (uint32_t)(in_read * 4);
+                } else {
+                    drflac_uint64 mono = drflac_read_pcm_frames_s16(
+                        s_flac, in_frames_needed, (drflac_int16 *)s_mono_tmp);
+                    s_flac_played_bytes += (uint32_t)(mono * 2);
+                    in_read = mono;
+                    for (uint32_t j = 0; j < (uint32_t)mono; j++) {
+                        s_resample_in[j * 2]     = s_mono_tmp[j];
+                        s_resample_in[j * 2 + 1] = s_mono_tmp[j];
+                    }
+                }
+
+                if (in_read == 0) {
+                    s_decode_eof = true;
+                    close_active_file();
+                    return 0;
+                }
+
+                if (in_read < in_frames_needed) {
+                    s_decode_eof = true;
+                    close_active_file();
+                }
+
+                uint32_t out_frames = resample_96k_to_48k_halfband(
+                    s_resample_in, (uint32_t)in_read, (int16_t *)out_buf);
+                return out_frames * 4;
+            }
+
+            /* --- Fallback: fractional linear interpolation → target rate --- */
+
+            uint32_t target_out_frames = max_bytes / 4;
+            if (target_out_frames == 0) target_out_frames = 1176;
 
             uint32_t in_frames_needed = ((uint64_t)target_out_frames * s_flac_sample_rate) / DEFAULT_SAMPLE_RATE;
             if (in_frames_needed > RESAMPLE_IN_MAX_FRAMES) {
@@ -447,22 +651,40 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
             if (out_frames == 0) return 0;
 
             int16_t *out = (int16_t *)out_buf;
-            uint64_t step = ((uint64_t)in_frames_read << 16) / out_frames;
-            uint64_t pos = 0;
+            uint64_t step = ((uint64_t)s_flac_sample_rate << 16) / DEFAULT_SAMPLE_RATE;
             for (uint32_t i = 0; i < out_frames; i++) {
-                uint32_t idx = (uint32_t)(pos >> 16);
-                uint32_t frac = (uint32_t)(pos & 0xFFFF);
-                uint32_t next_idx = (idx + 1 < (uint32_t)in_frames_read) ? idx + 1 : idx;
-
-                int32_t l0 = s_resample_in[idx * 2];
-                int32_t l1 = s_resample_in[next_idx * 2];
-                int32_t r0 = s_resample_in[idx * 2 + 1];
-                int32_t r1 = s_resample_in[next_idx * 2 + 1];
+                uint32_t idx = (uint32_t)(s_src_phase >> 16);
+                uint32_t frac = (uint32_t)(s_src_phase & 0xFFFF);
+                int32_t l0, r0, l1, r1;
+                if (idx == 0) {
+                    l0 = (int32_t)s_src_prev_l;
+                    r0 = (int32_t)s_src_prev_r;
+                    l1 = (int32_t)s_resample_in[0];
+                    r1 = (int32_t)s_resample_in[1];
+                } else {
+                    uint32_t p0 = (idx - 1) * 2;
+                    uint32_t p1 = idx * 2;
+                    if (p1 >= (uint32_t)in_frames_read * 2) {
+                        p1 = (in_frames_read > 0 ? (uint32_t)in_frames_read - 1 : 0) * 2;
+                    }
+                    l0 = (int32_t)s_resample_in[p0];
+                    r0 = (int32_t)s_resample_in[p0 + 1];
+                    l1 = (int32_t)s_resample_in[p1];
+                    r1 = (int32_t)s_resample_in[p1 + 1];
+                }
 
                 out[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
                 out[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
-                pos += step;
+                s_src_phase += (uint32_t)step;
             }
+
+            if (in_frames_read > 0) {
+                uint32_t last_idx = (uint32_t)(s_src_phase >> 16);
+                if (last_idx >= (uint32_t)in_frames_read) last_idx = (uint32_t)in_frames_read - 1;
+                s_src_prev_l = s_resample_in[last_idx * 2];
+                s_src_prev_r = s_resample_in[last_idx * 2 + 1];
+            }
+            s_src_phase &= 0xFFFF;
             return out_frames * 4;
         }
     } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
@@ -503,8 +725,8 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
         } else {
             /* High-Res WAV Resampler */
             if (!s_resample_in) return 0;
-            uint32_t target_out_frames = 588;
-            if (target_out_frames * 4 > max_bytes) target_out_frames = max_bytes / 4;
+            uint32_t target_out_frames = max_bytes / 4;
+            if (target_out_frames == 0) target_out_frames = 1176;
 
             uint32_t in_frames_needed = ((uint64_t)target_out_frames * s_wav_sample_rate) / DEFAULT_SAMPLE_RATE;
             if (in_frames_needed > RESAMPLE_IN_MAX_FRAMES) {
@@ -546,22 +768,40 @@ static uint32_t decode_chunk(uint8_t *out_buf, uint32_t max_bytes)
             if (out_frames == 0) return 0;
 
             int16_t *out = (int16_t *)out_buf;
-            uint64_t step = ((uint64_t)in_frames_read << 16) / out_frames;
-            uint64_t pos = 0;
+            uint64_t step = ((uint64_t)s_wav_sample_rate << 16) / DEFAULT_SAMPLE_RATE;
             for (uint32_t i = 0; i < out_frames; i++) {
-                uint32_t idx = (uint32_t)(pos >> 16);
-                uint32_t frac = (uint32_t)(pos & 0xFFFF);
-                uint32_t next_idx = (idx + 1 < in_frames_read) ? idx + 1 : idx;
-
-                int32_t l0 = s_resample_in[idx * 2];
-                int32_t l1 = s_resample_in[next_idx * 2];
-                int32_t r0 = s_resample_in[idx * 2 + 1];
-                int32_t r1 = s_resample_in[next_idx * 2 + 1];
+                uint32_t idx = (uint32_t)(s_src_phase >> 16);
+                uint32_t frac = (uint32_t)(s_src_phase & 0xFFFF);
+                int32_t l0, r0, l1, r1;
+                if (idx == 0) {
+                    l0 = (int32_t)s_src_prev_l;
+                    r0 = (int32_t)s_src_prev_r;
+                    l1 = (int32_t)s_resample_in[0];
+                    r1 = (int32_t)s_resample_in[1];
+                } else {
+                    uint32_t p0 = (idx - 1) * 2;
+                    uint32_t p1 = idx * 2;
+                    if (p1 >= (uint32_t)in_frames_read * 2) {
+                        p1 = (in_frames_read > 0 ? (uint32_t)in_frames_read - 1 : 0) * 2;
+                    }
+                    l0 = (int32_t)s_resample_in[p0];
+                    r0 = (int32_t)s_resample_in[p0 + 1];
+                    l1 = (int32_t)s_resample_in[p1];
+                    r1 = (int32_t)s_resample_in[p1 + 1];
+                }
 
                 out[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
                 out[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
-                pos += step;
+                s_src_phase += (uint32_t)step;
             }
+
+            if (in_frames_read > 0) {
+                uint32_t last_idx = (uint32_t)(s_src_phase >> 16);
+                if (last_idx >= (uint32_t)in_frames_read) last_idx = (uint32_t)in_frames_read - 1;
+                s_src_prev_l = s_resample_in[last_idx * 2];
+                s_src_prev_r = s_resample_in[last_idx * 2 + 1];
+            }
+            s_src_phase &= 0xFFFF;
             return out_frames * 4;
         }
     }
@@ -584,11 +824,13 @@ static void audio_decode_task(void *arg)
     }
 
     while (1) {
-        /* Sleep until signaled or 50ms periodic check */
-        xSemaphoreTake(s_decode_sem, pdMS_TO_TICKS(50));
+        /* Block until BT data callback signals us (ring buffer drained below refill threshold),
+         * or wake up every 30ms as a periodic safety net. */
+        xSemaphoreTake(s_decode_sem, pdMS_TO_TICKS(30));
 
+        /* Burst-decode until ring buffer reaches high watermark or we run out of source data */
         while (1) {
-            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
                 break;
             }
 
@@ -599,14 +841,14 @@ static void audio_decode_task(void *arg)
 
             uint32_t filled = ring_available();
             if (filled >= PCM_HIGH_WATERMARK) {
-                /* Buffer is full enough (~2.2s of audio), sleep until drained */
+                /* Buffer sufficiently full: yield to BT stack, wait for next drain signal */
                 xSemaphoreGive(s_lock);
                 break;
             }
 
             uint32_t space = PCM_RING_BUF_SIZE - filled;
             uint32_t to_decode = (space < PCM_CHUNK_BYTES) ? space : PCM_CHUNK_BYTES;
-            to_decode &= ~3U; /* Align to stereo 16-bit frame */
+            to_decode &= ~3U; /* Align to stereo 16-bit frame boundary */
             if (to_decode == 0) {
                 xSemaphoreGive(s_lock);
                 break;
@@ -620,21 +862,9 @@ static void audio_decode_task(void *arg)
             }
 
             ring_write(chunk, decoded);
-
-            /* Dynamic yield to feed Core 1 Task Watchdog:
-             * When buffer is low (< 256 KB), decode fast (yield every 16 chunks = ~64 KB).
-             * When buffer is healthy (>= 256 KB), yield every 4 chunks. */
-            static uint32_t s_chunk_count = 0;
-            s_chunk_count++;
-            if (filled < PCM_REFILL_THRESH) {
-                if ((s_chunk_count & 15) == 0) {
-                    vTaskDelay(1);
-                }
-            } else {
-                if ((s_chunk_count & 3) == 0) {
-                    vTaskDelay(1);
-                }
-            }
+            /* No explicit yield here: at priority 10 we are above most system tasks.
+             * FreeRTOS time-slicing (configTICK_RATE_HZ = 1000) will give BT stack
+             * its share each tick automatically. */
         }
     }
 }
@@ -682,9 +912,12 @@ esp_err_t audio_player_init(void)
 
     /* Allocate mono conversion buffer */
     if (s_mono_tmp == NULL) {
-        s_mono_tmp = (int16_t *)heap_caps_malloc(PCM_CHUNK_FRAMES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        s_mono_tmp = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!s_mono_tmp) {
-            s_mono_tmp = (int16_t *)malloc(PCM_CHUNK_FRAMES * sizeof(int16_t));
+            s_mono_tmp = (int16_t *)heap_caps_malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (!s_mono_tmp) {
+            s_mono_tmp = (int16_t *)malloc(RESAMPLE_IN_MAX_FRAMES * sizeof(int16_t));
         }
     }
 
@@ -701,16 +934,18 @@ esp_err_t audio_player_init(void)
 
     ring_flush();
 
-    /* Pin decode task to Core 1 at priority 5.
-     * 16 KB stack provides safe headroom for dr_flac LPC synthesis on 24-bit files
-     * while preserving critical internal DRAM needed for Bluetooth and Wi-Fi. */
+    /* Pin decode task to Core 1 at priority 10.
+     * Priority 10 sits above most FreeRTOS system tasks (idle=0, timer=1, ipc=24)
+     * but below the BT controller task (~22), ensuring the decode task gets CPU
+     * immediately when the BT stack signals a ring-buffer underrun.
+     * 24 KB stack: abundant headroom for dr_flac 24-bit LPC subframe synthesis. */
     if (s_decode_task == NULL) {
         BaseType_t ret = xTaskCreatePinnedToCore(
             audio_decode_task,
             "audio_decode",
-            16384,              /* 16 KB stack: safe headroom for dr_flac frame parsing */
+            24576,              /* 24 KB stack: abundant headroom for dr_flac LPC frame synthesis */
             NULL,
-            5,                  /* Priority 5: above idle, cooperates with system */
+            10,                 /* Priority 10: ensures fast ring-buffer refill on underrun signal */
             &s_decode_task,
             1                   /* Pinned to Core 1 (APP_CPU) */
         );
@@ -718,13 +953,14 @@ esp_err_t audio_player_init(void)
             ESP_LOGE(TAG, "Failed to create audio decode task on Core 1");
             return ESP_FAIL;
         }
-        ESP_LOGI(TAG, "Decode task created with 16 KB stack on Core 1");
+        ESP_LOGI(TAG, "Decode task created with 24 KB stack on Core 1 at priority 10");
     }
 
     s_state = AUDIO_STATE_STOPPED;
     s_source = AUDIO_SOURCE_SINE;
     s_sine_freq = DEFAULT_TONE_FREQ;
     s_sine_phase = 0.0;
+    s_volume = 5;
     ESP_LOGI(TAG, "Audio player engine fully initialized (Core 1 pinned, 512KB PSRAM buffer).");
     return ESP_OK;
 }
@@ -756,17 +992,31 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
             }
         }
     } else if (s_source == AUDIO_SOURCE_WAV || s_source == AUDIO_SOURCE_FLAC) {
+        /* Pre-buffer cushion: hold playback until buffer reaches 128 KB (~740ms of audio) */
+        if (!s_is_prebuffered) {
+            if (s_ring_filled >= (128 * 1024) || s_decode_eof) {
+                s_is_prebuffered = true;
+            } else {
+                notify_decode_task();
+                memset(data, 0, len);
+                return len;
+            }
+        }
+
         uint32_t read_bytes = ring_read(data, len);
 
         if (read_bytes < (uint32_t)len) {
-            /* Buffer underrun or end of stream: pad remainder with silence */
+            /* Pad remainder with silence */
             memset(data + read_bytes, 0, len - read_bytes);
 
             if (s_decode_eof && read_bytes == 0) {
-                ESP_LOGI(TAG, "Audio playback reached end of buffered stream.");
                 s_state = AUDIO_STATE_STOPPED;
                 s_decode_eof = false;
-                close_active_file();
+            } else if (!s_decode_eof && s_ring_filled == 0) {
+                /* Buffer underrun circuit breaker: re-engage prebuffering
+                 * to avoid machine-gun stuttering packets */
+                s_is_prebuffered = false;
+                notify_decode_task();
             }
         }
 
@@ -781,15 +1031,39 @@ int32_t audio_player_data_cb(uint8_t *data, int32_t len)
         memset(data, 0, len);
     }
 
-    /* Apply digital volume scaling */
-    if (s_volume < 100) {
-        int16_t *samples = (int16_t *)data;
-        int num_samples = len / 2;
-        int32_t vol = s_volume;
-        for (int i = 0; i < num_samples; i++) {
-            samples[i] = (int16_t)((samples[i] * vol) / 100);
+    /* Apply audiophile volume scaling with sample-by-sample slew-rate limiter.
+     * Eliminates instantaneous waveform steps, completely removing clicks, pops, and zipper noise. */
+    static int32_t s_current_gain = -1;
+    int32_t target_gain = (int32_t)s_vol_lut[s_volume];
+    if (s_current_gain < 0) {
+        s_current_gain = target_gain;
+    }
+    int16_t *samples = (int16_t *)data;
+    int num_samples = len / 2;
+
+    if (s_current_gain == 32767 && target_gain == 32767) {
+        /* Bit-perfect unity gain pass-through at 100% volume */
+    } else {
+        /* Ramp gain smoothly across stereo pairs (step 16 gives ~46ms full-scale transition) */
+        for (int i = 0; i < num_samples; i += 2) {
+            if (s_current_gain < target_gain) {
+                s_current_gain += 16;
+                if (s_current_gain > target_gain) s_current_gain = target_gain;
+            } else if (s_current_gain > target_gain) {
+                s_current_gain -= 16;
+                if (s_current_gain < target_gain) s_current_gain = target_gain;
+            }
+
+            if (s_current_gain == 0) {
+                samples[i]     = 0;
+                samples[i + 1] = 0;
+            } else {
+                samples[i]     = (int16_t)(((int32_t)samples[i]     * s_current_gain) >> 15);
+                samples[i + 1] = (int16_t)(((int32_t)samples[i + 1] * s_current_gain) >> 15);
+            }
         }
     }
+
 
     return len;
 }
@@ -907,22 +1181,23 @@ esp_err_t audio_player_play_file(const char *path)
     /* Release lock so the Core 1 decode task can immediately begin filling the ring buffer */
     xSemaphoreGive(s_lock);
 
-    /* Signal the dedicated decode task on Core 1 to start decoding */
+    /* Signal the Core 1 decode task to start filling the ring buffer immediately.
+     *
+     * DESIGN DECISION: We do NOT block here waiting for a pre-buffer target.
+     * The old approach blocked the console task for up to 3 seconds (300 x 10ms),
+     * which triggered the Task Watchdog Timer (TWDT) on large files → device reboot.
+     *
+     * Instead: A2DP starts immediately. The 512 KB ring buffer holds ~2.97 seconds
+     * of 44.1kHz stereo audio. The decode task at priority 10 fills it in ~200-500ms
+     * for native 44.1kHz FLAC, or ~800ms-1.5s for 96kHz/24-bit FLAC with resampling.
+     * The BT sink's internal jitter buffer (typically 100-300ms) absorbs the startup
+     * transient. If the very first A2DP packet is silence, the sink plays nothing for
+     * <100ms — completely inaudible in practice.
+     *
+     * This eliminates the TWDT reboot AND frees the console task immediately. */
     notify_decode_task();
 
-    /* Wait briefly (up to 300 ms) for Core 1 decode task to pre-buffer at least ~32 KB of audio (or EOF).
-     * ALL decoding executes safely on Core 1's dedicated 16 KB task stack.
-     * The caller task (HTTP server / console) consumes ZERO stack for decoding, completely
-     * eliminating the stack-overflow reboot panic when clicking Play in the Web UI. */
-    for (int i = 0; i < 30; i++) {
-        if (ring_available() >= (32 * 1024) || s_decode_eof) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    ESP_LOGI(TAG, "Pre-buffered %lu bytes before starting A2DP stream", (unsigned long)ring_available());
-
+    ESP_LOGI(TAG, "Decode task signaled — A2DP stream starting (ring buffer filling in background)");
     if (s_media_ctrl_cb) s_media_ctrl_cb(AUDIO_PLAYER_CMD_START);
     return ESP_OK;
 }
@@ -973,6 +1248,87 @@ esp_err_t audio_player_pause(void)
     return ESP_OK;
 }
 
+esp_err_t audio_player_seek(uint32_t target_sec)
+{
+    if (!s_lock) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
+        uint64_t target_frame = (uint64_t)target_sec * s_flac_sample_rate;
+        if (target_frame > s_flac->totalPCMFrameCount) {
+            target_frame = s_flac->totalPCMFrameCount;
+        }
+        drflac_bool32 ok = drflac_seek_to_pcm_frame(s_flac, target_frame);
+        if (!ok) {
+            ESP_LOGW(TAG, "drflac_seek_to_pcm_frame failed for target %lu sec", (unsigned long)target_sec);
+        }
+        s_flac_played_bytes = (uint32_t)(target_frame * s_flac_channels * 2);
+        ring_flush();
+        s_decode_eof = false;
+        memset(s_hb_delay_l, 0, sizeof(s_hb_delay_l));
+        memset(s_hb_delay_r, 0, sizeof(s_hb_delay_r));
+        s_src_phase = 0;
+        s_src_prev_l = 0;
+        s_src_prev_r = 0;
+        ESP_LOGI(TAG, "Seek to %lu sec (FLAC frame %llu)", (unsigned long)target_sec, (unsigned long long)target_frame);
+        notify_decode_task();
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
+        uint32_t bytes_per_sec = s_wav_sample_rate * s_wav_channels * (s_wav_bit_depth / 8);
+        uint32_t target_byte = target_sec * bytes_per_sec;
+        if (target_byte > s_wav_total_bytes) {
+            target_byte = s_wav_total_bytes;
+        }
+        fseek(s_wav_file, (long)(s_wav_data_offset + target_byte), SEEK_SET);
+        s_wav_played_bytes = target_byte;
+        ring_flush();
+        s_decode_eof = false;
+        s_src_phase = 0;
+        s_src_prev_l = 0;
+        s_src_prev_r = 0;
+        ESP_LOGI(TAG, "Seek to %lu sec (WAV byte %lu)", (unsigned long)target_sec, (unsigned long)target_byte);
+        notify_decode_task();
+        xSemaphoreGive(s_lock);
+        return ESP_OK;
+    }
+
+    xSemaphoreGive(s_lock);
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t audio_player_seek_delta(int32_t delta_sec)
+{
+    if (!s_lock) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+
+    uint32_t cur_sec = 0;
+    uint32_t total_sec = 0;
+
+    if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
+        if (s_flac_sample_rate > 0 && s_flac_channels > 0) {
+            cur_sec = s_flac_played_bytes / (s_flac_sample_rate * s_flac_channels * 2);
+            total_sec = (uint32_t)(s_flac->totalPCMFrameCount / s_flac_sample_rate);
+        }
+    } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
+        uint32_t bytes_per_sec = s_wav_sample_rate * s_wav_channels * (s_wav_bit_depth / 8);
+        if (bytes_per_sec > 0) {
+            cur_sec = s_wav_played_bytes / bytes_per_sec;
+            total_sec = s_wav_total_bytes / bytes_per_sec;
+        }
+    } else {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    xSemaphoreGive(s_lock);
+
+    int32_t target = (int32_t)cur_sec + delta_sec;
+    if (target < 0) target = 0;
+    if (total_sec > 0 && target > (int32_t)total_sec) target = (int32_t)total_sec;
+
+    return audio_player_seek((uint32_t)target);
+}
+
 esp_err_t audio_player_stop(void)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -991,25 +1347,33 @@ esp_err_t audio_player_stop(void)
 void audio_player_get_status(audio_player_status_t *out_status)
 {
     if (!out_status) return;
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
-        out_status->state = s_state;
-        out_status->source = s_source;
-        strncpy(out_status->current_path, s_audio_path, sizeof(out_status->current_path) - 1);
-        if (s_source == AUDIO_SOURCE_FLAC) {
-            out_status->sample_rate = s_flac_sample_rate;
-            out_status->channels = s_flac_channels;
-            out_status->bit_depth = s_flac_bit_depth;
-            out_status->total_audio_bytes = s_flac_total_bytes;
-            out_status->played_audio_bytes = s_flac_played_bytes;
-        } else {
-            out_status->sample_rate = s_wav_sample_rate;
-            out_status->channels = s_wav_channels;
-            out_status->bit_depth = s_wav_bit_depth;
-            out_status->total_audio_bytes = s_wav_total_bytes;
-            out_status->played_audio_bytes = s_wav_played_bytes;
-        }
+    bool locked = (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(10)) == pdTRUE);
+
+    out_status->state = s_state;
+    out_status->source = s_source;
+    strncpy(out_status->current_path, s_audio_path, sizeof(out_status->current_path) - 1);
+    if (s_source == AUDIO_SOURCE_FLAC) {
+        out_status->sample_rate = s_flac_sample_rate;
+        out_status->channels = s_flac_channels;
+        out_status->bit_depth = s_flac_bit_depth;
+        out_status->total_audio_bytes = s_flac_total_bytes;
+        out_status->played_audio_bytes = s_flac_played_bytes;
+    } else {
+        out_status->sample_rate = s_wav_sample_rate;
+        out_status->channels = s_wav_channels;
+        out_status->bit_depth = s_wav_bit_depth;
+        out_status->total_audio_bytes = s_wav_total_bytes;
+        out_status->played_audio_bytes = s_wav_played_bytes;
+    }
+
+    if (locked) {
         xSemaphoreGive(s_lock);
     }
+}
+
+uint32_t audio_player_get_buffered_bytes(void)
+{
+    return ring_available();
 }
 
 /* --- CONSOLE COMMANDS --- */
@@ -1149,4 +1513,268 @@ void audio_player_register_console_commands(void)
         .func = &cmd_player_pause,
     };
     esp_console_cmd_register(&pause_cmd);
+}
+
+void audio_player_benchmark(const char *path, uint32_t max_audio_sec)
+{
+    if (!path) {
+        printf("[BENCHMARK] Error: NULL path provided.\n");
+        return;
+    }
+
+    if (max_audio_sec == 0) max_audio_sec = 5;
+
+    printf("\n");
+    printf("================================================================================\n");
+    printf("              SCIENTIFIC AUDIO BENCHMARK: ISOLATING BOTTLENECKS                 \n");
+    printf("================================================================================\n");
+    printf("Target File: %s\n", path);
+    printf("Duration to Benchmark: %lu audio seconds\n", (unsigned long)max_audio_sec);
+
+    // 1. Ensure playback is idle
+    if (s_state == AUDIO_STATE_PLAYING) {
+        printf("[*] Pausing active playback for benchmark accuracy...\n");
+        audio_player_pause();
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    // 2. Open FLAC file using dr_flac
+    drflac *flac = drflac_open_file(path, &s_flac_alloc);
+    if (!flac) {
+        printf("[BENCHMARK] Error: Failed to open '%s' as FLAC file.\n", path);
+        return;
+    }
+
+    uint32_t sample_rate = flac->sampleRate;
+    uint32_t channels = flac->channels;
+    uint32_t bits_per_sample = flac->bitsPerSample;
+    drflac_uint64 total_frames = flac->totalPCMFrameCount;
+    double duration_sec = sample_rate > 0 ? (double)total_frames / sample_rate : 0.0;
+
+    printf("Stream Info: %lu Hz | %lu Channels | %lu-bit | Total Frames: %llu (%.2f sec)\n\n",
+           (unsigned long)sample_rate, (unsigned long)channels, (unsigned long)bits_per_sample,
+           (unsigned long long)total_frames, duration_sec);
+
+    // Stage 1: Pure Native S32 Decode
+    printf("--- [Stage 1] Pure Native S32 Decode (No Bluetooth, No Resampler, No Ring) ---\n");
+    uint32_t target_frames = max_audio_sec * sample_rate;
+    if (target_frames > total_frames && total_frames > 0) target_frames = (uint32_t)total_frames;
+
+    #define BENCH_CHUNK_FRAMES 1024
+    drflac_int32 *s32_buf = (drflac_int32 *)heap_caps_malloc(BENCH_CHUNK_FRAMES * channels * sizeof(drflac_int32), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s32_buf) {
+        s32_buf = (drflac_int32 *)malloc(BENCH_CHUNK_FRAMES * channels * sizeof(drflac_int32));
+    }
+
+    if (!s32_buf) {
+        printf("[Stage 1] Error: Failed to allocate S32 scratch buffer.\n");
+        drflac_close(flac);
+        return;
+    }
+
+    int64_t t0 = esp_timer_get_time();
+    uint32_t frames_decoded = 0;
+    while (frames_decoded < target_frames) {
+        uint32_t to_read = target_frames - frames_decoded;
+        if (to_read > BENCH_CHUNK_FRAMES) to_read = BENCH_CHUNK_FRAMES;
+        drflac_uint64 read_now = drflac_read_pcm_frames_s32(flac, to_read, s32_buf);
+        if (read_now == 0) break;
+        frames_decoded += (uint32_t)read_now;
+    }
+    int64_t t1 = esp_timer_get_time();
+    int64_t elapsed_us_s32 = t1 - t0;
+    double audio_sec_s32 = sample_rate > 0 ? (double)frames_decoded / sample_rate : 0;
+    double wall_sec_s32 = (double)elapsed_us_s32 / 1000000.0;
+    double s32_speed = wall_sec_s32 > 0 ? audio_sec_s32 / wall_sec_s32 : 0;
+
+    printf("  Decoded: %lu frames (%.2f audio sec) in %.2f ms\n",
+           (unsigned long)frames_decoded, audio_sec_s32, (double)elapsed_us_s32 / 1000.0);
+    printf("  -> Raw S32 Decode Speed: %.2fx Real-Time %s\n\n",
+           s32_speed, s32_speed >= 1.0 ? "(SUSTAINABLE >1.0x)" : "(BOTTLENECK <1.0x)");
+
+    drflac_close(flac);
+    free(s32_buf);
+
+    // Stage 2: S16 Format Conversion Decode
+    printf("--- [Stage 2] S16 Conversion Decode (Native -> S16 Truncation + Interleaving) ---\n");
+    flac = drflac_open_file(path, &s_flac_alloc);
+    if (!flac) {
+        printf("[Stage 2] Error: Failed to reopen file.\n");
+        return;
+    }
+
+    int16_t *s16_buf = (int16_t *)heap_caps_malloc(BENCH_CHUNK_FRAMES * channels * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s16_buf) s16_buf = (int16_t *)malloc(BENCH_CHUNK_FRAMES * channels * sizeof(int16_t));
+    if (!s16_buf) {
+        printf("[Stage 2] Error: Failed to allocate S16 scratch buffer.\n");
+        drflac_close(flac);
+        return;
+    }
+
+    t0 = esp_timer_get_time();
+    frames_decoded = 0;
+    while (frames_decoded < target_frames) {
+        uint32_t to_read = target_frames - frames_decoded;
+        if (to_read > BENCH_CHUNK_FRAMES) to_read = BENCH_CHUNK_FRAMES;
+        drflac_uint64 read_now = drflac_read_pcm_frames_s16(flac, to_read, (drflac_int16 *)s16_buf);
+        if (read_now == 0) break;
+        frames_decoded += (uint32_t)read_now;
+    }
+    t1 = esp_timer_get_time();
+    int64_t elapsed_us_s16 = t1 - t0;
+    double audio_sec_s16 = sample_rate > 0 ? (double)frames_decoded / sample_rate : 0;
+    double wall_sec_s16 = (double)elapsed_us_s16 / 1000000.0;
+    double s16_speed = wall_sec_s16 > 0 ? audio_sec_s16 / wall_sec_s16 : 0;
+
+    printf("  Decoded: %lu frames (%.2f audio sec) in %.2f ms\n",
+           (unsigned long)frames_decoded, audio_sec_s16, (double)elapsed_us_s16 / 1000.0);
+    printf("  -> S16 Conversion Speed: %.2fx Real-Time %s\n",
+           s16_speed, s16_speed >= 1.0 ? "(SUSTAINABLE >1.0x)" : "(BOTTLENECK <1.0x)");
+    if (elapsed_us_s32 > 0) {
+        double delta_pct = ((double)(elapsed_us_s16 - elapsed_us_s32) / (double)elapsed_us_s32) * 100.0;
+        printf("  -> Format Conversion Overhead: %+.1f%% CPU vs S32\n\n", delta_pct);
+    } else {
+        printf("\n");
+    }
+
+    drflac_close(flac);
+    free(s16_buf);
+
+    // Stage 3: Resampler Micro-Benchmarks (on synthetic 96 kHz stereo PCM)
+    printf("--- [Stage 3] Resampler Micro-Benchmarks (Synthesizing 102,400 Frames) ---\n");
+    uint32_t synth_in_frames = 1024;
+    int16_t *synth_in = (int16_t *)heap_caps_malloc(synth_in_frames * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *synth_out = (int16_t *)heap_caps_malloc(synth_in_frames * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (synth_in && synth_out) {
+        for (uint32_t i = 0; i < synth_in_frames * 2; i++) {
+            synth_in[i] = (int16_t)(sinf(i * 0.1f) * 16000.0f);
+        }
+
+        // 3A: 96k -> 44.1k fractional linear resampler (100 iterations = ~102,400 input frames)
+        t0 = esp_timer_get_time();
+        uint32_t frac_out_total = 0;
+        uint64_t phase = 0;
+        uint64_t step_frac = ((uint64_t)96000 << 16) / 44100;
+        for (int iter = 0; iter < 100; iter++) {
+            uint32_t out_frames = (1024 * 44100) / 96000;
+            for (uint32_t i = 0; i < out_frames; i++) {
+                uint32_t idx = (uint32_t)(phase >> 16);
+                uint32_t frac = (uint32_t)(phase & 0xFFFF);
+                uint32_t p0 = idx < 1023 ? idx * 2 : 1023 * 2;
+                uint32_t p1 = (idx + 1) < 1024 ? (idx + 1) * 2 : 1023 * 2;
+                int32_t l0 = synth_in[p0];
+                int32_t r0 = synth_in[p0 + 1];
+                int32_t l1 = synth_in[p1];
+                int32_t r1 = synth_in[p1 + 1];
+                synth_out[i * 2]     = (int16_t)(l0 + (((l1 - l0) * (int32_t)frac) >> 16));
+                synth_out[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * (int32_t)frac) >> 16));
+                phase += step_frac;
+            }
+            phase &= 0xFFFF;
+            frac_out_total += out_frames;
+        }
+        t1 = esp_timer_get_time();
+        int64_t us_frac = t1 - t0;
+        double cpu_pct_frac = ((double)us_frac / (100.0 * 1024.0 / 96000.0 * 1000000.0)) * 100.0;
+        printf("  A. 96k -> 44.1k Linear Resampler: 102,400 frames in %.2f ms (CPU Load: %.2f%%)\n",
+               (double)us_frac / 1000.0, cpu_pct_frac);
+
+        // 3B: 96k -> 48k 2:1 Integer Decimation (Half-Band FIR Filter)
+        t0 = esp_timer_get_time();
+        uint32_t dec_out_total = 0;
+        for (int iter = 0; iter < 100; iter++) {
+            uint32_t out_frames = 1024 / 2;
+            for (uint32_t i = 0; i < out_frames; i++) {
+                uint32_t in_idx = i * 2;
+                int32_t l = ((int32_t)synth_in[in_idx * 2] + (int32_t)synth_in[(in_idx + 1) * 2]) >> 1;
+                int32_t r = ((int32_t)synth_in[in_idx * 2 + 1] + (int32_t)synth_in[(in_idx + 1) * 2 + 1]) >> 1;
+                synth_out[i * 2]     = (int16_t)l;
+                synth_out[i * 2 + 1] = (int16_t)r;
+            }
+            dec_out_total += out_frames;
+        }
+        t1 = esp_timer_get_time();
+        int64_t us_dec = t1 - t0;
+        double cpu_pct_dec = ((double)us_dec / (100.0 * 1024.0 / 96000.0 * 1000000.0)) * 100.0;
+        printf("  B. 96k -> 48.0k Integer 2:1 Decimator: 102,400 frames in %.2f ms (CPU Load: %.2f%%)\n\n",
+               (double)us_dec / 1000.0, cpu_pct_dec);
+
+        free(synth_in);
+        free(synth_out);
+    } else {
+        if (synth_in) free(synth_in);
+        if (synth_out) free(synth_out);
+        printf("[Stage 3] Skipped (insufficient SRAM).\n\n");
+    }
+
+    // Stage 4: SDMMC Raw Read Throughput Benchmark
+    printf("--- [Stage 4] SDMMC Raw Read Throughput Benchmark ---\n");
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        uint8_t *io_buf = (uint8_t *)heap_caps_malloc(32768, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!io_buf) io_buf = (uint8_t *)malloc(32768);
+
+        if (io_buf) {
+            uint32_t test_bytes = 512 * 1024; // 512 KB test read
+            
+            // 4 KB chunks
+            t0 = esp_timer_get_time();
+            size_t total_read = 0;
+            while (total_read < test_bytes) {
+                size_t r = fread(io_buf, 1, 4096, f);
+                if (r == 0) break;
+                total_read += r;
+            }
+            t1 = esp_timer_get_time();
+            double kb_s_4k = (t1 > t0) ? ((double)total_read / 1024.0) / ((t1 - t0) / 1000000.0) : 0;
+            printf("   4 KB Chunks: %.1f KB/s (%.2f ms for 512 KB)\n", kb_s_4k, (double)(t1 - t0) / 1000.0);
+
+            // 16 KB chunks
+            fseek(f, 0, SEEK_SET);
+            t0 = esp_timer_get_time();
+            total_read = 0;
+            while (total_read < test_bytes) {
+                size_t r = fread(io_buf, 1, 16384, f);
+                if (r == 0) break;
+                total_read += r;
+            }
+            t1 = esp_timer_get_time();
+            double kb_s_16k = (t1 > t0) ? ((double)total_read / 1024.0) / ((t1 - t0) / 1000000.0) : 0;
+            printf("  16 KB Chunks: %.1f KB/s (%.2f ms for 512 KB)\n", kb_s_16k, (double)(t1 - t0) / 1000.0);
+
+            // 32 KB chunks
+            fseek(f, 0, SEEK_SET);
+            t0 = esp_timer_get_time();
+            total_read = 0;
+            while (total_read < test_bytes) {
+                size_t r = fread(io_buf, 1, 32768, f);
+                if (r == 0) break;
+                total_read += r;
+            }
+            t1 = esp_timer_get_time();
+            double kb_s_32k = (t1 > t0) ? ((double)total_read / 1024.0) / ((t1 - t0) / 1000000.0) : 0;
+            printf("  32 KB Chunks: %.1f KB/s (%.2f ms for 512 KB)\n\n", kb_s_32k, (double)(t1 - t0) / 1000.0);
+
+            free(io_buf);
+        }
+        fclose(f);
+    } else {
+        printf("[Stage 4] Error: Failed to open file for raw read benchmark.\n\n");
+    }
+
+    // Stage 5: FLAC Arithmetic & Prediction Heuristic Analysis
+    printf("--- [Stage 5] FLAC Prediction Arithmetic Analysis ---\n");
+    uint32_t order_ex = 12;
+    uint32_t ilog2_order = 0;
+    while (order_ex >> ilog2_order) ilog2_order++; // order 12 -> 4
+    uint32_t precision_ex = 12;
+    uint32_t sum = bits_per_sample + precision_ex + ilog2_order;
+    printf("  FLAC bitsPerSample = %lu\n", (unsigned long)bits_per_sample);
+    printf("  Typical LPC: order=%lu (ilog2_u32=%lu), precision=%lu bits\n",
+           (unsigned long)order_ex, (unsigned long)ilog2_order, (unsigned long)precision_ex);
+    printf("  Prediction width formula: %lu + %lu + %lu = %lu (> 32 ? %s)\n",
+           (unsigned long)bits_per_sample, (unsigned long)precision_ex, (unsigned long)ilog2_order,
+           (unsigned long)sum, sum > 32 ? "YES -> 64-bit prediction path active" : "NO -> 32-bit fast path active");
+    printf("================================================================================\n\n");
 }

@@ -6,6 +6,7 @@
 #include "esp_bt_defs.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
+#include "esp_avrc_api.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,8 +38,12 @@ typedef struct {
     bt_mgr_audio_state_t audio_state;
     bool is_scanning;
     char connected_name[64];
-    char connected_bda_str[18];
+    char connected_bda_str[24];
     uint8_t discovered_count;
+    char codec_name[32];
+    uint32_t sample_rate;
+    uint32_t bitrate_kbps;
+    uint8_t bitpool;
 } bt_mgr_status_t;
 
 /**
@@ -108,6 +113,20 @@ size_t bt_manager_get_discovered_devices(bt_device_entry_t *out_devices, size_t 
  */
 void bt_manager_clear_discovered_devices(void);
 
+/**
+ * @brief AVRCP controller event callback passed to esp_avrc_ct_register_callback.
+ */
+void bt_manager_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
+
+/**
+ * @brief Set Bluetooth sink hardware amplifier volume via AVRCP Absolute Volume command.
+ *
+ * @param volume_pct Volume in percent (0 to 100).
+ * @return ESP_OK on success.
+ */
+esp_err_t bt_manager_set_volume(uint8_t volume_pct);
+
 #ifdef __cplusplus
 }
 #endif
+

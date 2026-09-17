@@ -9,14 +9,40 @@ The firmware streams audio to Bluetooth headphones and speakers using a custom S
 ## Current Status
 
 * **Bluetooth Stack:** ESP-IDF Bluedroid classic Bluetooth A2DP Source.
-* **Codec Engine:** Patched `bta_av_co.c` overriding standard SBC negotiation. It forces Dual Channel, 16 blocks, 8 subbands, and raises maximum bitpool from 53 to 250 (~453 to 552 kbps).
-* **Audio Synthesis:** Real-time 440 Hz stereo sine wave generator synthesized mathematically at 44.1 kHz, 16-bit to validate throughput without physical storage attached.
-* **Control Interface:** Interactive UART command-line interface running on UART0 (`esp_console`).
+* **Codec Engine:** Patched `bta_av_co.c` implementing adaptive SBC negotiation: Dual Channel (SBC XQ @ ~452–492 kbps, bitpool 38) for audiophile fidelity, with universal Joint Stereo fallback (328 kbps, bitpool 53). Prioritizes 44.1 kHz native feeding to bypass Bluedroid software upsampling.
+* **Audio Playback:** Lossless FLAC (16-bit / 24-bit, 44.1k/48k/96k) via `dr_flac` and uncompressed WAV PCM, with seek, fast-forward (+10s), and rewind (-10s).
+* **Audio Synthesis:** Real-time stereo sine wave generator synthesized mathematically at 44.1 kHz, 16-bit (`tone <freq>`).
+* **Control Interface:** Interactive UART command-line interface (`esp_console`) and Web Serial Dashboard (`index.html`) with real-time Bluetooth codec, bitrate, and timeline scrubbing.
 * **Hardware Target:** ESP32-CAM (silkscreen HW-297) with an Ai-Thinker ESP-32S module, 8MB SPI Flash, and an on-board ESP_PSRAM64H (8MB) PSRAM chip.
 * **Display Target:** Nokia C1-01 LCD (128x160 resolution, 9-bit SPI, ST7735 controller).
-* **Storage Target:** Built-in MicroSD slot on the HW-297 board via hardware SDMMC.
+* **Storage Target:** Built-in MicroSD slot on the HW-297 board via hardware SDMMC (1-bit mode @ 20 MHz).
 
 For detailed hardware specifications, pin tables, and memory calculations, see [HARDWARE.md](HARDWARE.md). For feature roadmap and driver limits, see [FEATURES.md](FEATURES.md).
+
+---
+
+## Supported Audio Formats & File Specifications
+
+### Audio Formats Matrix
+
+| Format | Bit Depth | Sample Rates | Channels | Playback Engine | Throughput / Overhead |
+|:---|:---|:---|:---|:---|:---|
+| **FLAC (Standard Lossless)** | 16-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | `dr_flac` streaming decoder | Native bit-perfect decoding into 512 KB PSRAM ring buffer |
+| **FLAC (High Quality Lossless)** | 24-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | `dr_flac` S32 fixed-point | Decoded via 32-bit arithmetic, scaled to 16-bit for A2DP |
+| **FLAC (Studio Master)** | 24-bit | 88.2 kHz, 96.0 kHz | Stereo & Mono | `dr_flac` + integer decimation | Decoded and downsampled to 44.1k / 48k for A2DP compatibility |
+| **WAV (Linear PCM)** | 16-bit | 44.1 kHz, 48.0 kHz | Stereo & Mono | Native RIFF parser | Zero CPU decode overhead; direct SD-to-ring-buffer DMA streaming |
+| **Diagnostic Sine Tone** | 16-bit | 44.1 kHz | Stereo | Mathematical synthesis | Generates pure test tone (`tone <freq>`) without SD card |
+| **MP3 (MPEG-1/2 Layer III)** | 16-bit | 32.0–48.0 kHz | Stereo & Mono | `minimp3` (Roadmap) | Lightweight fixed-point decoder scheduled for next phase |
+
+### File Size Guidelines & Performance
+
+* **Standard File Sizes (10 MB to 60 MB):** 
+  Standard 3 to 6-minute CD-quality FLAC and WAV tracks (15 MB–45 MB) play with instant pre-buffering (~740 ms cushion) and uninterrupted playback.
+* **Large File Sizes (>100 MB):**
+  Files over 100 MB (such as high-res 24-bit/96kHz master files or full live albums) are supported via the 512 KB PSRAM ring buffer. To ensure smooth playback of very large lossless files:
+  1. **Format SD Card as FAT32 with 16 KB or 32 KB Cluster Size (Allocation Unit Size):** 
+     Default 4 KB clusters cause excessive FAT lookup fragmentation during sustained multi-megabyte reads. Formatting the MicroSD card with **16 KB (`16384` bytes)** or **32 KB** clusters aligns directly with the hardware SDMMC driver multi-block read chunks, doubling SD throughput.
+  2. **Card Speed Class:** Use Class 10 / UHS-I U1 or higher MicroSD cards.
 
 ---
 
@@ -99,21 +125,40 @@ Once booted, the firmware presents a REPL prompt (`esp32>`) over UART0 at 115200
 | `play` | None | Resumes active audio streaming |
 | `pause` | None | Suspends active audio streaming |
 | `stop` | None | Stops audio streaming and rewinds file |
-| `play_file` | `<path>` | Plays an uncompressed WAV file from SD card |
-| `tone` | `[frequency_hz]` | Generates mathematical sine test tone (default 440 Hz) |
-| `status` | None | Displays playback state, file format, duration, and progress |
+| `play_file` | `<path>` | Plays a lossless FLAC or WAV file from SD card |
+| `seek` | `<seconds>` | Seeks directly to an absolute timestamp in the track |
+| `ff` | `[seconds]` | Fast forwards playback by specified delta (default +10s) |
+| `rew` | `[seconds]` | Rewinds playback by specified delta (default -10s) |
+| `volume` | `[percentage]` | Gets or sets digital logarithmic volume (0–100%) |
+| `status` | None | Comprehensive playback state, format, time, and BT codec/bitrate |
+| `status_json` | None | Compact JSON telemetry for Web Serial Dashboard |
+| `scan_json` | None | Discovered Bluetooth sinks as JSON array |
+| `ls_json` | `[path]` | Directory listing as JSON for Web UI file browser |
 | `ls` | `[path]` | Lists files and directories on SD card with size and LFN |
 | `cat` | `<path> [bytes]`| Dumps initial bytes of a file on SD card |
 | `sdinfo` | None | Displays SD card hardware CID/CSD metadata and capacity |
 | `mem` | None | Displays internal SRAM, external PSRAM, and DMA heap statistics |
+| `benchmark_audio`| `<path> [sec]` | Runs micro-benchmark isolating SDMMC, FLAC S32/S16 decode, and resamplers |
+| `restart` | None | Software reboots the ESP32 |
 
+---
+
+## Web Serial Dashboard
+
+A browser-based management dashboard (`index.html`) connects directly to the ESP32 UART over Web Serial (Google Chrome / Microsoft Edge):
+
+* **Live Playback Controls:** Play, Pause, Stop, Fast-Forward (+10s), Rewind (-10s), and click-to-seek progress scrubber.
+* **Bluetooth Audio Sink Management:** GAP device scanning, one-click connection, auto-reconnect, and disconnection.
+* **Real-time Codec & Bitrate Reporting:** Live badge showing negotiated profile (e.g. `SBC XQ (Dual Ch) @ 452 kbps`, bitpool 38, 44.1 kHz).
+* **Interactive SD File Browser:** Live directory browsing with single-click file launch.
+* **Perceptual Volume:** Logarithmic slider synchronized via AVRCP Absolute Volume.
 
 ---
 
 ## Project Roadmap
 
 1. **Step 1: Link & Codec Validation (Complete)**
-   * Confirm SBC XQ negotiation (bitpool 250, Dual Channel) and test audio transmission.
+   * Confirm SBC XQ negotiation (Dual Channel, bitpool 38 @ ~452 kbps) and adaptive Joint Stereo fallback.
    * Verify console REPL controls.
 
 2. **Step 2: External PSRAM Activation & SDMMC Driver (Complete)**
@@ -122,13 +167,13 @@ Once booted, the firmware presents a REPL prompt (`esp32>`) over UART0 at 115200
    * Mount FATFS with long filename (LFN) support and verify file directory listing via `ls` / `cat`.
    * Implement real-time heap diagnostics (`mem`).
 
-3. **Step 3: Multi-Format Audio Decoding Pipeline (Next)**
-   * Implement WAV (uncompressed PCM), MP3 (Helix decoder), and FLAC (Dr_Flac) decoders.
-   * Allocate 1MB PSRAM stream read buffer and 256KB decoded PCM ring buffer.
-   * Connect decoder output stream to `bt_app_a2d_data_cb`.
+3. **Step 3: Multi-Format Audio Decoding Pipeline (Complete)**
+   * WAV (uncompressed PCM) and FLAC (dr_flac 16-bit / 24-bit) decoders fully implemented.
+   * 512 KB PSRAM circular ring buffer with 128 KB pre-buffering cushion on dedicated Core 1 decode task.
+   * Seeking and fast-forward/rewind support (`seek`, `ff`, `rew`).
 
-4. **Step 4: ID3 Album Art Extraction & Nokia C1-01 Display Integration**
+4. **Step 4: ID3 Album Art Extraction & Nokia C1-01 Display Integration (Next)**
    * Port the 9-bit SPI driver from `E:\rouf\hardware-project\nokia-c1-01-display-driver` as a project component.
    * Wire Nokia C1-01 LCD: CS (`GPIO5`), SCK (`GPIO18`), MOSI (`GPIO19`), RST (`GPIO13`).
    * Extract embedded ID3 JPEG album art and scale to 128x128 using `TJpgDec`.
-   * Render playback progress, track title, artist, and album art.
+   * Render playback progress, track title, artist, and album art with UI animations per `.agents/skills/ui-animation-design/`.

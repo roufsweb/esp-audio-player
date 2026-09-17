@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Audiophile A2DP Player — Web Serial Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07090e;
+      --bg-surface: #0f1420;
+      --card: rgba(18, 24, 38, 0.75);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --card-border-glow: rgba(0, 242, 254, 0.25);
+      --text: #f8fafc;
+      --text-muted: #8492a6;
+      --text-dim: #475569;
+      --cyan: #00f2fe;
+      --blue: #4facfe;
+      --purple: #7f00ff;
+      --indigo: #6366f1;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+      --font-main: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(0, 242, 254, 0.08) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(127, 0, 255, 0.08) 0%, transparent 45%);
+      background-attachment: fixed;
+      color: var(--text);
+      font-family: var(--font-main);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1100px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* HEADER */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding: 16px 24px;
+      background: var(--card);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .logo-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--cyan), var(--purple));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 20px rgba(0, 242, 254, 0.35);
+    }
+
+    .brand-text h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      background: linear-gradient(90deg, #fff, var(--cyan));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-text span {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    /* BUTTONS */
+    button {
+      cursor: pointer;
+      border: none;
+      outline: none;
+      border-radius: 10px;
+      font-family: var(--font-main);
+      font-weight: 600;
+      font-size: 0.85rem;
+      padding: 10px 18px;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn-connect {
+      background: linear-gradient(135deg, var(--cyan), #00c6ff);
+      color: #040914;
+      box-shadow: 0 0 18px rgba(0, 242, 254, 0.35);
+    }
+    .btn-connect:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 0 24px rgba(0, 242, 254, 0.55);
+    }
+
+    .btn-disconnect {
+      background: rgba(244, 63, 94, 0.15);
+      color: var(--rose);
+      border: 1px solid rgba(244, 63, 94, 0.3);
+    }
+    .btn-disconnect:hover {
+      background: var(--rose);
+      color: #fff;
+      box-shadow: 0 0 16px rgba(244, 63, 94, 0.4);
+    }
+
+    .btn-action {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+      border: 1px solid var(--card-border);
+    }
+    .btn-action:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-play {
+      background: linear-gradient(135deg, #10b981, #059669);
+      color: #fff;
+      box-shadow: 0 0 15px rgba(16, 185, 129, 0.3);
+    }
+    .btn-play:hover {
+      transform: scale(1.04);
+      box-shadow: 0 0 22px rgba(16, 185, 129, 0.5);
+    }
+
+    .btn-pause {
+      background: linear-gradient(135deg, #f59e0b, #d97706);
+      color: #fff;
+      box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
+    }
+
+    .btn-stop {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border: 1px solid var(--card-border);
+    }
+
+    .btn-sm {
+      padding: 6px 12px;
+      font-size: 0.78rem;
+      border-radius: 8px;
+    }
+
+    /* BADGES */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--card-border);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+    }
+    .dot.green { background: var(--emerald); box-shadow: 0 0 8px var(--emerald); }
+    .dot.blue { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+    .dot.amber { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+    .dot.red { background: var(--rose); box-shadow: 0 0 8px var(--rose); }
+
+    /* GRID LAYOUT */
+    .grid-main {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 20px;
+    }
+    @media (min-width: 900px) {
+      .grid-main {
+        grid-template-columns: 1.2fr 0.8fr;
+      }
+    }
+
+    .card {
+      background: var(--card);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--card-border);
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* NOW PLAYING DECK */
+    .deck-container {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      text-align: center;
+    }
+
+    .track-title {
+      font-size: 1.45rem;
+      font-weight: 800;
+      color: #fff;
+      word-break: break-all;
+      min-height: 2.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-shadow: 0 0 20px rgba(0, 242, 254, 0.2);
+    }
+
+    .format-pills {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      background: rgba(0, 242, 254, 0.08);
+      border: 1px solid rgba(0, 242, 254, 0.2);
+      color: var(--cyan);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    /* VISUALIZER CANVAS */
+    .visualizer-box {
+      width: 100%;
+      height: 80px;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      overflow: hidden;
+      position: relative;
+    }
+
+    canvas#visCanvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* PROGRESS BAR */
+    .progress-box {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .progress-track {
+      width: 100%;
+      height: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--cyan), var(--purple));
+      border-radius: 6px;
+      transition: width 0.3s ease;
+      box-shadow: 0 0 10px var(--cyan);
+    }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    /* CONTROLS */
+    .deck-controls {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 14px;
+      margin-top: 4px;
+    }
+
+    .ctrl-circle {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+    }
+
+    /* VOLUME SECTION */
+    .volume-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      margin-top: 6px;
+    }
+
+    .vol-header {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.82rem;
+      font-weight: 600;
+    }
+
+    .vol-slider-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+      outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--cyan);
+      cursor: pointer;
+      box-shadow: 0 0 10px var(--cyan);
+      transition: all 0.15s ease;
+    }
+    input[type=range]::-webkit-slider-thumb:hover {
+      transform: scale(1.2);
+    }
+
+    .vol-presets {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+    }
+    .vol-presets button {
+      padding: 4px 10px;
+      font-size: 0.72rem;
+      border-radius: 6px;
+    }
+
+    /* RIGHT COLUMN: BLUETOOTH & SYSTEM */
+    .side-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* DEVICE LIST */
+    .dev-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 220px;
+      overflow-y: auto;
+      margin-top: 10px;
+      padding-right: 4px;
+    }
+    .dev-list::-webkit-scrollbar { width: 4px; }
+    .dev-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 4px; }
+
+    .dev-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      transition: all 0.15s;
+    }
+    .dev-item:hover {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .dev-meta h4 {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #fff;
+    }
+    .dev-meta span {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    /* FILE EXPLORER */
+    .file-explorer {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .file-actions {
+      display: flex;
+      gap: 10px;
+    }
+    .search-input {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      color: #fff;
+      font-family: var(--font-main);
+      font-size: 0.85rem;
+      outline: none;
+    }
+    .search-input:focus {
+      border-color: var(--cyan);
+      box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);
+    }
+
+    .file-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 280px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .file-list::-webkit-scrollbar { width: 4px; }
+    .file-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 4px; }
+
+    .file-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      transition: all 0.15s;
+    }
+    .file-row:hover {
+      background: rgba(0, 242, 254, 0.04);
+      border-color: rgba(0, 242, 254, 0.25);
+    }
+
+    .file-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      overflow: hidden;
+    }
+    .file-type-badge {
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+    .type-flac { background: rgba(0, 242, 254, 0.15); color: var(--cyan); }
+    .type-wav { background: rgba(127, 0, 255, 0.2); color: #c084fc; }
+    .file-name {
+      font-size: 0.85rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 420px;
+    }
+    .file-size {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      min-width: 70px;
+      text-align: right;
+    }
+
+    /* TELEMETRY GAUGES */
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 10px;
+    }
+
+    .gauge-item {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .gauge-label {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .gauge-val {
+      font-size: 1.15rem;
+      font-weight: 800;
+      color: #fff;
+      font-family: var(--font-mono);
+    }
+
+    /* TERMINAL */
+    .term-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .term-log {
+      width: 100%;
+      height: 160px;
+      background: #04060a;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: #a7f3d0;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.4;
+    }
+    .term-input-row {
+      display: flex;
+      gap: 8px;
+    }
+    .term-input {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      outline: none;
+    }
+    .term-input:focus {
+      border-color: var(--cyan);
+    }
+
+    /* NOTIFICATION TOAST */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: var(--bg-surface);
+      border: 1px solid var(--card-border);
+      padding: 12px 20px;
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      font-size: 0.85rem;
+      font-weight: 500;
+      display: none;
+      z-index: 100;
+      animation: fadeIn 0.3s;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    
+    <!-- HEADER & SERIAL CONNECTION -->
+    <header>
+      <div class="brand">
+        <div class="logo-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>Audiophile A2DP Player</h1>
+          <span>ESP32-CAM (HW-297) &bull; Pure BT Audio &bull; Web Serial Dashboard</span>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div class="badge" id="connBadge">
+          <span class="dot" id="connDot"></span>
+          <span id="connText">Disconnected</span>
+        </div>
+        <button id="btnConnect" class="btn-connect" onclick="toggleSerial()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+          Connect USB
+        </button>
+      </div>
+    </header>
+
+    <!-- MAIN TWO-COLUMN SECTION -->
+    <div class="grid-main">
+      
+      <!-- LEFT: PLAYER DECK & VOLUME -->
+      <div class="card">
+        <div class="card-title">
+          <span>Now Playing Deck</span>
+          <span class="badge" id="playerStateBadge"><span class="dot" id="playerStateDot"></span><span id="playerStateText">STOPPED</span></span>
+        </div>
+
+        <div class="deck-container">
+          <div class="track-title" id="trackTitle">No Track Playing</div>
+
+          <div class="format-pills">
+            <div class="pill" id="pillFormat">FORMAT: NONE</div>
+            <div class="pill" id="pillRate">44.1 kHz</div>
+            <div class="pill" id="pillBits">16-bit</div>
+            <div class="pill" id="pillChannels">Stereo</div>
+            <div class="pill" id="pillBtCodec" style="border-color: rgba(127, 0, 255, 0.4); color: #c084fc;">BT: Disconnected</div>
+          </div>
+
+          <!-- AUDIO VISUALIZER -->
+          <div class="visualizer-box">
+            <canvas id="visCanvas"></canvas>
+          </div>
+
+          <!-- PROGRESS BAR & TIME SCRUBBER -->
+          <div class="progress-box">
+            <div class="progress-track" id="progressTrack" onclick="onSeekClick(event)" title="Click anywhere to seek">
+              <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="progress-meta">
+              <span id="posTime" style="color: var(--cyan); font-weight: 600;">00:00 / 00:00</span>
+              <span id="posBytes">0.0 MB / 0.0 MB</span>
+              <span id="posPct">0%</span>
+            </div>
+          </div>
+
+          <!-- CONTROLS WITH SEEK (REW / FF) -->
+          <div class="deck-controls">
+            <button class="btn-action ctrl-circle" title="440Hz Sine Test Tone" onclick="sendCmd('tone 440')">&#9835;</button>
+            <button class="btn-action ctrl-circle" id="btnRew" title="Rewind 10 Seconds (-10s)" onclick="sendCmd('rew 10')">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="11 19 2 12 11 5 11 19"></polygon>
+                <polygon points="22 19 13 12 22 5 22 19"></polygon>
+              </svg>
+            </button>
+            <button class="btn-play ctrl-circle" id="btnPlay" title="Play / Resume" onclick="sendCmd('play')">&#9654;</button>
+            <button class="btn-action ctrl-circle" id="btnPause" title="Pause" onclick="sendCmd('pause')">&#10074;&#10074;</button>
+            <button class="btn-action ctrl-circle" id="btnFf" title="Fast Forward 10 Seconds (+10s)" onclick="sendCmd('ff 10')">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="13 19 22 12 13 5 13 19"></polygon>
+                <polygon points="2 19 11 12 2 5 2 19"></polygon>
+              </svg>
+            </button>
+            <button class="btn-stop ctrl-circle" id="btnStop" title="Stop" onclick="sendCmd('stop')">&#9632;</button>
+          </div>
+
+          <!-- VOLUME CONTROL -->
+          <div class="volume-box">
+            <div class="vol-header">
+              <span>Perceptual Volume (Logarithmic Curve)</span>
+              <span id="volValueText" style="color: var(--cyan); font-family: var(--font-mono);">5%</span>
+            </div>
+            <div class="vol-slider-row">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon></svg>
+              <input type="range" id="volSlider" min="0" max="100" value="5" oninput="onVolSlider(this.value)" onpointerdown="onVolSliderStart()" onpointerup="onVolSliderEnd()" onmousedown="onVolSliderStart()" onmouseup="onVolSliderEnd()">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
+            </div>
+            <div class="vol-presets">
+              <button class="btn-action btn-sm" onclick="setVolume(0)">Mute</button>
+              <button class="btn-action btn-sm" onclick="setVolume(5)">5%</button>
+              <button class="btn-action btn-sm" onclick="setVolume(15)">15%</button>
+              <button class="btn-action btn-sm" onclick="setVolume(30)">30%</button>
+              <button class="btn-action btn-sm" onclick="setVolume(50)">50%</button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- RIGHT: BLUETOOTH & TELEMETRY -->
+      <div class="side-stack">
+        
+        <!-- BLUETOOTH SINK CARD -->
+        <div class="card">
+          <div class="card-title">
+            <span>Bluetooth Audio Sink</span>
+            <button class="btn-action btn-sm" id="btnScan" onclick="startScan()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+              Scan
+            </button>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: rgba(255,255,255,0.02); border-radius: 10px; border: 1px solid var(--card-border);">
+            <div>
+              <div style="font-size: 0.85rem; font-weight: 700; color: #fff;" id="btConnectedName">No Device Connected</div>
+              <div style="font-size: 0.72rem; color: var(--text-muted); font-family: var(--font-mono);" id="btConnectedMac">--:--:--:--:--:--</div>
+            </div>
+            <button class="btn-disconnect btn-sm" id="btnDisconnectBt" style="display: none;" onclick="sendCmd('disconnect')">Disconnect</button>
+          </div>
+
+          <!-- NEGOTIATED CODEC & STREAM QUALITY TELEMETRY -->
+          <div id="btStreamQualityBox" style="margin-top: 10px; padding: 12px 14px; background: rgba(0, 242, 254, 0.03); border: 1px solid rgba(0, 242, 254, 0.12); border-radius: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.8px; color: var(--cyan); font-weight: 700;">Negotiated Stream Quality</span>
+              <span class="badge" id="btStreamStateBadge" style="font-size: 0.68rem; padding: 2px 8px;">DISCONNECTED</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.8rem;">
+              <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">A2DP Codec</div>
+                <div style="font-weight: 700; color: #fff; font-family: var(--font-mono); margin-top: 2px;" id="btCodecVal">--</div>
+              </div>
+              <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Stream Bitrate</div>
+                <div style="font-weight: 700; color: var(--cyan); font-family: var(--font-mono); margin-top: 2px;" id="btBitrateVal">-- kbps</div>
+              </div>
+              <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">Bitpool / Param</div>
+                <div style="font-weight: 600; color: #cbd5e1; font-family: var(--font-mono); margin-top: 2px;" id="btBitpoolVal">--</div>
+              </div>
+              <div style="background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                <div style="font-size: 0.68rem; color: var(--text-muted); text-transform: uppercase;">A2DP Sample Rate</div>
+                <div style="font-weight: 600; color: #cbd5e1; font-family: var(--font-mono); margin-top: 2px;" id="btSampleRateVal">-- kHz</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="dev-list" id="devList">
+            <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; padding: 20px;">
+              Click "Scan" to discover nearby headphones / speakers.
+            </div>
+          </div>
+        </div>
+
+        <!-- HARDWARE TELEMETRY & DIAGNOSTICS -->
+        <div class="card">
+          <div class="card-title">
+            <span>Hardware Telemetry</span>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn-action btn-sm" onclick="sendCmd('display_test')" title="Send color bar pattern to Nokia C1-01 display">Display Test</button>
+              <button class="btn-action btn-sm" onclick="sendCmd('restart')" title="Reboot ESP32">Reboot</button>
+            </div>
+          </div>
+
+          <div class="telemetry-grid">
+            <div class="gauge-item">
+              <span class="gauge-label">SRAM Free</span>
+              <span class="gauge-val" id="valSram">-- KB</span>
+            </div>
+            <div class="gauge-item">
+              <span class="gauge-label">PSRAM Free</span>
+              <span class="gauge-val" id="valPsram">-- KB</span>
+            </div>
+            <div class="gauge-item">
+              <span class="gauge-label">Audio Cache</span>
+              <span class="gauge-val" id="valBuf">-- KB</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- FULL WIDTH: MICROSD FILE EXPLORER -->
+    <div class="card file-explorer">
+      <div class="card-title">
+        <span>MicroSD Track Browser (/sdcard)</span>
+        <button class="btn-action btn-sm" onclick="refreshFiles()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+          Refresh
+        </button>
+      </div>
+
+      <div class="file-actions">
+        <input type="text" class="search-input" id="searchFilter" placeholder="Filter audio files (.flac, .wav)..." oninput="filterFiles()">
+      </div>
+
+      <div class="file-list" id="fileList">
+        <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; padding: 24px;">
+          Connect via Web Serial to browse tracks on MicroSD card.
+        </div>
+      </div>
+    </div>
+
+    <!-- LIVE SERIAL TERMINAL -->
+    <div class="card term-box">
+      <div class="card-title">
+        <span>Live Serial Console (115200 Baud)</span>
+        <button class="btn-action btn-sm" onclick="clearTerm()">Clear</button>
+      </div>
+
+      <div class="term-log" id="termLog"></div>
+
+      <div class="term-input-row">
+        <input type="text" class="term-input" id="termInput" placeholder="Type esp32 console command (e.g. status, scan, ls, tone 1000)..." onkeydown="onTermKey(event)">
+        <button class="btn-action btn-sm" onclick="sendCustomCmd()">Send</button>
+      </div>
+    </div>
+
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // --- STATE MANAGEMENT ---
+    let port = null;
+    let reader = null;
+    let writer = null;
+    let keepReading = false;
+    let isConnected = false;
+    let pollInterval = null;
+    let rawFiles = [];
+    let isPlayingAudio = false;
+    let currentTotalSec = 0;
+    let currentPosSec = 0;
+    let lastConnectedMac = localStorage.getItem('esp_last_bt_mac') || '';
+    let lastConnectedName = localStorage.getItem('esp_last_bt_name') || '';
+
+    // Format seconds as MM:SS
+    function formatTime(sec) {
+      if (!sec || isNaN(sec) || sec < 0) return '00:00';
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+
+    // Interactive timeline scrubber click-to-seek
+    function onSeekClick(e) {
+      if (!isConnected) {
+        showToast('Connect USB to control playback.');
+        return;
+      }
+      const track = document.getElementById('progressTrack');
+      const rect = track.getBoundingClientRect();
+      const clickX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+      const pct = clickX / rect.width;
+      if (currentTotalSec > 0) {
+        const targetSec = Math.round(pct * currentTotalSec);
+        sendCmd(`seek ${targetSec}`);
+        showToast(`Seeking to ${formatTime(targetSec)} (${Math.round(pct * 100)}%)...`);
+      } else {
+        showToast('Timeline seek available during active audio playback.');
+      }
+    }
+
+    // --- VISUALIZER ANIMATION ---
+    const canvas = document.getElementById('visCanvas');
+    const ctx = canvas.getContext('2d');
+    let animFrame = null;
+    const barCount = 32;
+    let barHeights = new Array(barCount).fill(4);
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function renderVisualizer() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const barWidth = (canvas.width / barCount) - 3;
+
+      for (let i = 0; i < barCount; i++) {
+        if (isPlayingAudio) {
+          // Dynamic simulated frequency bars
+          const target = Math.sin(Date.now() * 0.005 + i * 0.4) * 20 + Math.random() * 35 + 10;
+          barHeights[i] += (target - barHeights[i]) * 0.25;
+        } else {
+          barHeights[i] += (4 - barHeights[i]) * 0.1;
+        }
+
+        const h = Math.max(4, Math.min(canvas.height - 8, barHeights[i]));
+        const x = i * (barWidth + 3);
+        const y = canvas.height - h;
+
+        const grad = ctx.createLinearGradient(0, y, 0, canvas.height);
+        grad.addColorStop(0, '#00f2fe');
+        grad.addColorStop(1, '#7f00ff');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.roundRect(x, y, barWidth, h, [3, 3, 0, 0]);
+        ctx.fill();
+      }
+
+      animFrame = requestAnimationFrame(renderVisualizer);
+    }
+    renderVisualizer();
+
+    // --- TOAST NOTIFICATIONS ---
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.innerText = msg;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 3000);
+    }
+
+    // --- WEB SERIAL INTERACTION ---
+    async function toggleSerial() {
+      if (isConnected) {
+        await disconnectSerial();
+      } else {
+        await connectSerial();
+      }
+    }
+
+    async function connectSerial() {
+      if (!('serial' in navigator)) {
+        alert('Web Serial API is not available.\nPlease open via a local server (e.g. http://localhost:8080) in Google Chrome or Microsoft Edge.');
+        return;
+      }
+
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        isConnected = true;
+        keepReading = true;
+
+        updateConnBadge(true);
+        showToast('Connected to ESP32 Serial (115200)');
+
+        // Start non-blocking reader loop
+        readSerialLoop();
+
+        // Start background polling for status (every 2s)
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(() => {
+          if (isConnected) {
+            sendCmd('status_json');
+          }
+        }, 2000);
+
+        // Initial status and directory fetch
+        setTimeout(() => {
+          sendCmd('volume 5');
+          sendCmd('status_json');
+          sendCmd('ls_json');
+        }, 300);
+
+      } catch (err) {
+        console.error('Serial connection error:', err);
+        showToast('Connection error: ' + (err.message || err));
+        await disconnectSerial();
+      }
+    }
+
+    async function disconnectSerial() {
+      keepReading = false;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+
+      if (reader) {
+        try {
+          await reader.cancel();
+        } catch (e) {}
+        try {
+          reader.releaseLock();
+        } catch (e) {}
+        reader = null;
+      }
+
+      if (port) {
+        try {
+          await port.close();
+        } catch (e) {}
+        port = null;
+      }
+
+      isConnected = false;
+      updateConnBadge(false);
+      showToast('Disconnected from ESP32');
+    }
+
+    function updateConnBadge(connected) {
+      const dot = document.getElementById('connDot');
+      const text = document.getElementById('connText');
+      const btn = document.getElementById('btnConnect');
+
+      if (connected) {
+        dot.className = 'dot green';
+        text.innerText = 'Connected (115200)';
+        btn.className = 'btn-disconnect';
+        btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg> Disconnect';
+      } else {
+        dot.className = 'dot';
+        text.innerText = 'Disconnected';
+        btn.className = 'btn-connect';
+        btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg> Connect USB';
+      }
+    }
+
+    async function sendCmd(cmd) {
+      if (!port || !port.writable || !isConnected) return;
+      try {
+        logTerm('> ' + cmd, true);
+        const encoder = new TextEncoder();
+        const data = encoder.encode(cmd + '\r\n');
+        const writer = port.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
+      } catch (e) {
+        console.error('Send error:', e);
+      }
+    }
+
+    // --- BULLETPROOF STREAM READER & PARSER ---
+    async function readSerialLoop() {
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (port && port.readable && keepReading) {
+        try {
+          reader = port.readable.getReader();
+          while (keepReading) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop(); // keep partial line remainder
+
+              for (const line of lines) {
+                handleSerialLine(line.trim());
+              }
+            }
+          }
+        } catch (err) {
+          if (keepReading) {
+            console.warn('Reader loop error (will retry in 500ms):', err.message);
+            // Brief pause before retrying — avoids tight busy-loop on transient errors
+            await new Promise(r => setTimeout(r, 500));
+          }
+        } finally {
+          if (reader) {
+            try { reader.releaseLock(); } catch (e) {}
+            reader = null;
+          }
+        }
+        // If keepReading is false, user triggered disconnect: exit loop cleanly
+        if (!keepReading) break;
+      }
+
+      // Only auto-disconnect if we actually lost the port unexpectedly
+      if (isConnected) {
+        await disconnectSerial();
+      }
+    }
+
+
+    function handleSerialLine(line) {
+      if (!line) return;
+
+      // Log to terminal
+      logTerm(line);
+
+      // Try JSON parse if line begins with {
+      if (line.startsWith('{') && line.endsWith('}')) {
+        try {
+          const data = JSON.parse(line);
+          if (data.type === 'status') {
+            applyStatus(data);
+          } else if (data.type === 'scan') {
+            applyScan(data);
+          } else if (data.type === 'ls') {
+            applyFileList(data);
+          }
+        } catch (e) {
+          // Not valid JSON, ignore
+        }
+      }
+    }
+
+    // --- APPLY STATUS TELEMETRY ---
+    function applyStatus(s) {
+      // Player State
+      const stateDot = document.getElementById('playerStateDot');
+      const stateText = document.getElementById('playerStateText');
+      stateText.innerText = s.state;
+
+      isPlayingAudio = (s.state === 'PLAYING');
+
+      if (s.state === 'PLAYING') {
+        stateDot.className = 'dot green';
+      } else if (s.state === 'PAUSED') {
+        stateDot.className = 'dot amber';
+      } else {
+        stateDot.className = 'dot';
+      }
+
+      // Title & Format
+      if (s.file && s.file.length > 0) {
+        const base = s.file.split('/').pop();
+        document.getElementById('trackTitle').innerText = base;
+      } else if (s.source === 'SINE') {
+        document.getElementById('trackTitle').innerText = 'Pure Sine Wave Generator';
+      } else {
+        document.getElementById('trackTitle').innerText = 'No Track Playing';
+      }
+
+      document.getElementById('pillFormat').innerText = s.source;
+      document.getElementById('pillRate').innerText = (s.sample_rate ? (s.sample_rate / 1000) : 44.1) + ' kHz';
+      document.getElementById('pillBits').innerText = (s.bits || 16) + '-bit';
+      document.getElementById('pillChannels').innerText = (s.channels === 1) ? 'Mono' : 'Stereo';
+
+      // Bluetooth Codec Pill on Player Deck
+      const pillBt = document.getElementById('pillBtCodec');
+      if (pillBt) {
+        if (s.bt_state === 'CONNECTED') {
+          const cName = (s.bt_codec && s.bt_codec !== 'None') ? s.bt_codec : 'SBC';
+          const bRate = s.bt_bitrate ? `${s.bt_bitrate} kbps` : '';
+          pillBt.innerText = `BT: ${cName} ${bRate}`.trim();
+          pillBt.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+          pillBt.style.color = 'var(--cyan)';
+        } else if (s.bt_state === 'CONNECTING') {
+          pillBt.innerText = 'BT: Connecting...';
+          pillBt.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+          pillBt.style.color = 'var(--amber)';
+        } else {
+          pillBt.innerText = 'BT: Disconnected';
+          pillBt.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+          pillBt.style.color = 'var(--text-muted)';
+        }
+      }
+
+      // Progress & Time
+      currentPosSec = s.pos_sec || 0;
+      currentTotalSec = s.total_sec || 0;
+
+      if (s.total_sec > 0) {
+        document.getElementById('posTime').innerText = `${formatTime(s.pos_sec)} / ${formatTime(s.total_sec)}`;
+      } else {
+        document.getElementById('posTime').innerText = '00:00 / 00:00';
+      }
+
+      const posMB = (s.pos / (1024 * 1024)).toFixed(1);
+      const totalMB = (s.total / (1024 * 1024)).toFixed(1);
+      document.getElementById('posBytes').innerText = `${posMB} MB / ${totalMB} MB`;
+
+      if (s.total > 0) {
+        const pct = Math.min(100, Math.max(0, (s.pos / s.total) * 100));
+        document.getElementById('progressBar').style.width = pct + '%';
+        document.getElementById('posPct').innerText = Math.round(pct) + '%';
+      } else {
+        document.getElementById('progressBar').style.width = '0%';
+        document.getElementById('posPct').innerText = '0%';
+      }
+
+      // Volume — only update slider from telemetry when user is not dragging it
+      if (s.volume !== undefined && !volSliderActive) {
+        document.getElementById('volSlider').value = s.volume;
+        document.getElementById('volValueText').innerText = s.volume + '%';
+      }
+
+      // Bluetooth State & Remote Device
+      const btName = document.getElementById('btConnectedName');
+      const btMac = document.getElementById('btConnectedMac');
+      const btnDis = document.getElementById('btnDisconnectBt');
+
+      if (s.bt_state === 'CONNECTED') {
+        btName.innerText = s.sink_name || 'Connected Audio Sink';
+        btMac.innerText = s.sink_mac || '';
+        if (s.sink_mac) {
+          lastConnectedMac = s.sink_mac;
+          lastConnectedName = s.sink_name || 'Audio Sink';
+          try {
+            localStorage.setItem('esp_last_bt_mac', lastConnectedMac);
+            localStorage.setItem('esp_last_bt_name', lastConnectedName);
+          } catch (e) {}
+        }
+        btnDis.className = 'btn-disconnect btn-sm';
+        btnDis.style.display = 'inline-flex';
+        btnDis.innerText = 'Disconnect';
+        btnDis.onclick = () => sendCmd('disconnect');
+      } else if (s.bt_state === 'CONNECTING') {
+        btName.innerText = 'Connecting...';
+        btMac.innerText = s.sink_mac || '';
+        btnDis.style.display = 'none';
+      } else {
+        if (lastConnectedMac) {
+          btName.innerText = lastConnectedName ? `Saved: ${lastConnectedName}` : 'Previously Connected';
+          btMac.innerText = lastConnectedMac;
+          btnDis.className = 'btn-action btn-sm';
+          btnDis.style.display = 'inline-flex';
+          btnDis.innerText = 'Reconnect';
+          btnDis.onclick = () => {
+            sendCmd(`connect ${lastConnectedMac}`);
+            showToast(`Connecting to ${lastConnectedName || lastConnectedMac}...`);
+          };
+        } else {
+          btName.innerText = 'No Device Connected';
+          btMac.innerText = '--:--:--:--:--:--';
+          btnDis.style.display = 'none';
+        }
+      }
+
+      // Bluetooth Negotiated Quality Telemetry
+      const btCodecVal = document.getElementById('btCodecVal');
+      const btBitrateVal = document.getElementById('btBitrateVal');
+      const btBitpoolVal = document.getElementById('btBitpoolVal');
+      const btSampleRateVal = document.getElementById('btSampleRateVal');
+      const btStreamStateBadge = document.getElementById('btStreamStateBadge');
+
+      if (s.bt_state === 'CONNECTED') {
+        if (btCodecVal) btCodecVal.innerText = (s.bt_codec && s.bt_codec !== 'None') ? s.bt_codec : 'SBC';
+        if (btBitrateVal) btBitrateVal.innerText = s.bt_bitrate ? `${s.bt_bitrate} kbps` : '-- kbps';
+        if (btBitpoolVal) btBitpoolVal.innerText = s.bt_bitpool ? `Bitpool: ${s.bt_bitpool}` : 'Bitpool: 38 (XQ)';
+        if (btSampleRateVal) btSampleRateVal.innerText = s.bt_rate ? `${(s.bt_rate / 1000).toFixed(1)} kHz` : '44.1 kHz';
+
+        if (btStreamStateBadge) {
+          if (s.bt_codec && s.bt_codec.includes('XQ')) {
+            btStreamStateBadge.innerText = 'SBC XQ HIGH-DEF';
+            btStreamStateBadge.style.background = 'rgba(0, 242, 254, 0.15)';
+            btStreamStateBadge.style.color = 'var(--cyan)';
+            btStreamStateBadge.style.borderColor = 'rgba(0, 242, 254, 0.35)';
+          } else {
+            btStreamStateBadge.innerText = 'HQ STEREO';
+            btStreamStateBadge.style.background = 'rgba(16, 185, 129, 0.15)';
+            btStreamStateBadge.style.color = 'var(--emerald)';
+            btStreamStateBadge.style.borderColor = 'rgba(16, 185, 129, 0.35)';
+          }
+        }
+      } else if (s.bt_state === 'CONNECTING') {
+        if (btCodecVal) btCodecVal.innerText = 'Negotiating...';
+        if (btBitrateVal) btBitrateVal.innerText = '-- kbps';
+        if (btBitpoolVal) btBitpoolVal.innerText = '--';
+        if (btSampleRateVal) btSampleRateVal.innerText = '-- kHz';
+        if (btStreamStateBadge) {
+          btStreamStateBadge.innerText = 'NEGOTIATING...';
+          btStreamStateBadge.style.background = 'rgba(245, 158, 11, 0.15)';
+          btStreamStateBadge.style.color = 'var(--amber)';
+          btStreamStateBadge.style.borderColor = 'rgba(245, 158, 11, 0.35)';
+        }
+      } else {
+        if (btCodecVal) btCodecVal.innerText = '--';
+        if (btBitrateVal) btBitrateVal.innerText = '-- kbps';
+        if (btBitpoolVal) btBitpoolVal.innerText = '--';
+        if (btSampleRateVal) btSampleRateVal.innerText = '-- kHz';
+        if (btStreamStateBadge) {
+          btStreamStateBadge.innerText = 'DISCONNECTED';
+          btStreamStateBadge.style.background = 'rgba(255, 255, 255, 0.05)';
+          btStreamStateBadge.style.color = 'var(--text-muted)';
+          btStreamStateBadge.style.borderColor = 'var(--card-border)';
+        }
+      }
+
+      // Gauges
+      document.getElementById('valSram').innerText = (s.sram ? Math.round(s.sram / 1024) : '--') + ' KB';
+      document.getElementById('valPsram').innerText = (s.psram ? (s.psram / (1024 * 1024)).toFixed(2) : '--') + ' MB';
+      document.getElementById('valBuf').innerText = (s.buf ? Math.round(s.buf / 1024) : '0') + ' KB';
+    }
+
+    // --- APPLY BLUETOOTH SCAN ---
+    function applyScan(data) {
+      const devList = document.getElementById('devList');
+      devList.innerHTML = '';
+
+      if (!data.devices || data.devices.length === 0) {
+        devList.innerHTML = '<div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; padding: 14px;">No devices found. Ensure your headphones/speaker are in pairing mode.</div>';
+        return;
+      }
+
+      data.devices.forEach(dev => {
+        const row = document.createElement('div');
+        row.className = 'dev-item';
+        row.innerHTML = `
+          <div class="dev-meta">
+            <h4>${dev.name || 'Unnamed Device'}</h4>
+            <span>${dev.mac} &bull; RSSI: ${dev.rssi} dBm</span>
+          </div>
+          <button class="btn-action btn-sm" onclick="sendCmd('connect ${dev.mac}')">Connect</button>
+        `;
+        devList.appendChild(row);
+      });
+    }
+
+    function startScan() {
+      sendCmd('scan');
+      showToast('Starting Bluetooth GAP inquiry scan (10s)...');
+      setTimeout(() => {
+        sendCmd('scan_json');
+      }, 3500);
+      setTimeout(() => {
+        sendCmd('scan_json');
+      }, 8000);
+    }
+
+    // --- APPLY FILE EXPLORER ---
+    function applyFileList(data) {
+      rawFiles = data.files || [];
+      renderFileList(rawFiles);
+    }
+
+    function renderFileList(files) {
+      const list = document.getElementById('fileList');
+      list.innerHTML = '';
+
+      const audioFiles = files.filter(f => !f.is_dir && (f.name.endsWith('.flac') || f.name.endsWith('.wav')));
+
+      if (audioFiles.length === 0) {
+        list.innerHTML = '<div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; padding: 24px;">No .flac or .wav tracks found in /sdcard</div>';
+        return;
+      }
+
+      audioFiles.forEach(f => {
+        const isFlac = f.name.endsWith('.flac');
+        const sizeMB = (f.size / (1024 * 1024)).toFixed(1);
+        const row = document.createElement('div');
+        row.className = 'file-row';
+
+        const info = document.createElement('div');
+        info.className = 'file-info';
+        info.innerHTML = `
+          <span class="file-type-badge ${isFlac ? 'type-flac' : 'type-wav'}">${isFlac ? 'FLAC' : 'WAV'}</span>
+          <span class="file-name" title="${f.name}">${f.name}</span>
+        `;
+
+        const actions = document.createElement('div');
+        actions.style.display = 'flex';
+        actions.style.alignItems = 'center';
+        actions.style.gap = '14px';
+
+        const sizeSpan = document.createElement('span');
+        sizeSpan.className = 'file-size';
+        sizeSpan.innerText = sizeMB + ' MB';
+
+        const playBtn = document.createElement('button');
+        playBtn.className = 'btn-play btn-sm';
+        playBtn.innerHTML = '&#9654; Play';
+        playBtn.onclick = () => playTrack(f.path);
+
+        actions.appendChild(sizeSpan);
+        actions.appendChild(playBtn);
+
+        row.appendChild(info);
+        row.appendChild(actions);
+        list.appendChild(row);
+      });
+    }
+
+    function filterFiles() {
+      const q = document.getElementById('searchFilter').value.toLowerCase();
+      const filtered = rawFiles.filter(f => f.name.toLowerCase().includes(q));
+      renderFileList(filtered);
+    }
+
+    function refreshFiles() {
+      sendCmd('ls_json');
+      showToast('Refreshing MicroSD directory...');
+    }
+
+    function playTrack(path) {
+      sendCmd(`play_file "${path}"`);
+      showToast(`Playing: ${path.split('/').pop()}`);
+    }
+
+    // --- VOLUME CONTROL ---
+    let volTimeout = null;
+    let volSliderActive = false;  // True while user is dragging the slider
+
+    function onVolSliderStart() { volSliderActive = true; }
+    function onVolSliderEnd() {
+      volSliderActive = false;
+      // Send the final value when they release
+      const val = document.getElementById('volSlider').value;
+      if (volTimeout) clearTimeout(volTimeout);
+      sendCmd(`volume ${val}`);
+    }
+
+    function onVolSlider(val) {
+      document.getElementById('volValueText').innerText = val + '%';
+      if (volTimeout) clearTimeout(volTimeout);
+      volTimeout = setTimeout(() => {
+        sendCmd(`volume ${val}`);
+      }, 80);
+    }
+
+    function setVolume(val) {
+      document.getElementById('volSlider').value = val;
+      document.getElementById('volValueText').innerText = val + '%';
+      sendCmd(`volume ${val}`);
+    }
+
+    // --- TERMINAL LOGGING & INPUT ---
+    const termLog = document.getElementById('termLog');
+    function logTerm(text, isCmd = false) {
+      if (!text) return;
+      const d = document.createElement('div');
+      d.style.color = isCmd ? '#38bdf8' : '#a7f3d0';
+      d.innerText = text;
+      termLog.appendChild(d);
+      while (termLog.childNodes.length > 300) {
+        termLog.removeChild(termLog.firstChild);
+      }
+      termLog.scrollTop = termLog.scrollHeight;
+    }
+
+    function clearTerm() {
+      termLog.innerHTML = '';
+    }
+
+    function onTermKey(e) {
+      if (e.key === 'Enter') {
+        sendCustomCmd();
+      }
+    }
+
+    function sendCustomCmd() {
+      const input = document.getElementById('termInput');
+      const val = input.value.trim();
+      if (val) {
+        sendCmd(val);
+        input.value = '';
+      }
+    }
+  </script>
+</body>
+</html>

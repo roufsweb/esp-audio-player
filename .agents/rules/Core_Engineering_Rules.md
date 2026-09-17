@@ -23,6 +23,8 @@ These rules govern all engineering, development, and documentation work on this 
 - Strictly forbidden: AI fluff, generic marketing buzzwords (e.g., "seamless", "cutting-edge", "delve", "leverage", "tapestry").
 - Focus on real hardware facts: GPIO maps, timing requirements, memory footprints, buffer sizes, and API contracts.
 
-## 5. Living Documentation Maintenance
-- `HARDWARE.md` and `README.md` must be kept accurate and up to date.
-- Whenever hardware pinouts, board models, memory configurations, or software architecture changes occur, update these documents in the same step.
+## 5. Living Documentation & Feature Maintenance
+- `README.md`, `FEATURES.md`, and `HARDWARE.md` must be kept accurate and up to date.
+- Whenever any feature is added, modified, optimized, or verified, update `README.md` and `FEATURES.md` in the exact same step.
+- Document all user-facing console commands, format capabilities, bitrates, buffer allocations, and architectural decisions.
+- Maintain a clear status log of verified working features vs planned items.

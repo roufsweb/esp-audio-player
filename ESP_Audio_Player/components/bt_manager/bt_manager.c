@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
+#include "esp_avrc_api.h"
 
 static const char *TAG = "BT_MGR";
 
@@ -19,8 +21,13 @@ static bool s_is_scanning = false;
 static bt_mgr_a2d_state_t s_a2d_state = BT_MGR_A2D_STATE_DISCONNECTED;
 static bt_mgr_audio_state_t s_audio_state = BT_MGR_AUDIO_STATE_SUSPEND;
 
+static bool s_avrc_connected = false;
+static uint8_t s_avrc_tl = 0;
+static uint8_t s_current_volume_pct = 5;
+
 static esp_bd_addr_t s_connected_bda = {0};
-static char s_connected_bda_str[18] = {0};
+
+static char s_connected_bda_str[24] = {0};
 static char s_connected_name[64] = {0};
 
 static bt_device_entry_t s_devices[BT_MAX_DISCOVERED_DEVICES];
@@ -41,8 +48,12 @@ esp_err_t bt_manager_init(void)
     s_device_count = 0;
     memset(s_devices, 0, sizeof(s_devices));
     memset(s_connected_bda, 0, sizeof(s_connected_bda));
-    s_connected_bda_str[0] = '\0';
-    s_connected_name[0] = '\0';
+    memset(s_connected_bda_str, 0, sizeof(s_connected_bda_str));
+    memset(s_connected_name, 0, sizeof(s_connected_name));
+    s_avrc_connected = false;
+    s_avrc_tl = 0;
+    s_current_volume_pct = 5;
+
 
     /* Configure Secure Simple Pairing (SSP) with "No Input No Output" for auto Just Works pairing */
     esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
@@ -218,6 +229,65 @@ void bt_manager_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     }
 }
 
+void bt_manager_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+        if (param->conn_stat.connected) {
+            ESP_LOGI(TAG, "AVRCP Controller connected to target device.");
+            s_avrc_connected = true;
+            /* Immediately synchronize hardware amplifier volume to current level */
+            bt_manager_set_volume(s_current_volume_pct);
+        } else {
+            ESP_LOGI(TAG, "AVRCP Controller disconnected.");
+            s_avrc_connected = false;
+        }
+        break;
+
+    case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
+        ESP_LOGI(TAG, "AVRCP Target confirmed Absolute Volume: %d/127 (%.1f%%)",
+                 param->set_volume_rsp.volume,
+                 (param->set_volume_rsp.volume * 100.0) / 127.0);
+        break;
+
+    case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
+        if (param->change_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+            ESP_LOGI(TAG, "AVRCP Target reported hardware volume change: %d/127",
+                     param->change_ntf.event_parameter.volume);
+        }
+        break;
+
+    case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
+        ESP_LOGI(TAG, "AVRCP Remote features: 0x%08" PRIx32, param->rmt_feats.feat_mask);
+        break;
+
+    default:
+        break;
+    }
+}
+
+esp_err_t bt_manager_set_volume(uint8_t volume_pct)
+{
+    if (volume_pct > 100) volume_pct = 100;
+    s_current_volume_pct = volume_pct;
+
+    if (!s_avrc_connected) {
+        /* AVRCP not yet connected, saved for sync upon connection */
+        return ESP_OK;
+    }
+
+    uint8_t avrc_vol = (uint8_t)((volume_pct * 127 + 50) / 100);
+    uint8_t tl = (s_avrc_tl++) & 0x0F;
+    esp_err_t ret = esp_avrc_ct_send_set_absolute_volume_cmd(tl, avrc_vol);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send AVRCP set_absolute_volume (%d/127): %s",
+                 avrc_vol, esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Sent AVRCP SetAbsoluteVolume: %d/127 (TL: %u)", avrc_vol, tl);
+    }
+    return ret;
+}
+
 esp_err_t bt_manager_start_scan(uint8_t duration_sec)
 {
     if (duration_sec < 1) duration_sec = 10;
@@ -340,9 +410,18 @@ esp_err_t bt_manager_disconnect(void)
     return esp_a2d_source_disconnect(s_connected_bda);
 }
 
+extern bool bta_av_co_get_active_codec_info(char *codec_name, size_t max_name_len, uint32_t *rate, uint32_t *bitrate_kbps, uint8_t *bitpool);
+
 void bt_manager_get_status(bt_mgr_status_t *out_status)
 {
     if (!out_status) return;
+    memset(out_status->connected_name, 0, sizeof(out_status->connected_name));
+    memset(out_status->connected_bda_str, 0, sizeof(out_status->connected_bda_str));
+    memset(out_status->codec_name, 0, sizeof(out_status->codec_name));
+    out_status->sample_rate = 0;
+    out_status->bitrate_kbps = 0;
+    out_status->bitpool = 0;
+
     if (xSemaphoreTake(s_bt_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
         out_status->a2d_state = s_a2d_state;
         out_status->audio_state = s_audio_state;
@@ -350,14 +429,21 @@ void bt_manager_get_status(bt_mgr_status_t *out_status)
         strncpy(out_status->connected_name, s_connected_name, sizeof(out_status->connected_name) - 1);
         strncpy(out_status->connected_bda_str, s_connected_bda_str, sizeof(out_status->connected_bda_str) - 1);
         out_status->discovered_count = s_device_count;
+
+        if (s_a2d_state == BT_MGR_A2D_STATE_CONNECTED) {
+            bta_av_co_get_active_codec_info(out_status->codec_name, sizeof(out_status->codec_name),
+                                           &out_status->sample_rate, &out_status->bitrate_kbps,
+                                           &out_status->bitpool);
+        } else {
+            strncpy(out_status->codec_name, "None", sizeof(out_status->codec_name) - 1);
+        }
         xSemaphoreGive(s_bt_lock);
     } else {
         out_status->a2d_state = s_a2d_state;
         out_status->audio_state = s_audio_state;
         out_status->is_scanning = s_is_scanning;
-        out_status->connected_name[0] = '\0';
-        out_status->connected_bda_str[0] = '\0';
         out_status->discovered_count = 0;
+        strncpy(out_status->codec_name, "None", sizeof(out_status->codec_name) - 1);
     }
 }
 
