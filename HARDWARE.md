@@ -80,22 +80,21 @@ The MicroSD card slot on the underside of the HW-297 PCB is routed to the ESP32 
 
 ---
 
-### D. Nokia C1-01 Display Pin Assignments & Options
+### D. Nokia C1-01 Display Pin Assignments (100% Reclaimed Camera FPC)
 
-The Nokia C1-01 display uses a 9-bit SPI protocol (1 D/C bit + 8 data bits packed in software), requiring **no separate D/C pin** and **no MISO pin**. Only 4 lines are required:
+The Nokia C1-01 display uses a 9-bit SPI protocol (1 D/C bit + 8 data bits packed in software), requiring **no separate D/C pin** and **no MISO pin**. The entire display (power, ground, SPI bus, reset, and backlight) can be powered and controlled directly from the **24-pin Camera Connector (`Cam1`)**:
 
-| Display Signal | Assigned GPIO | Physical Location | Bus / Peripheral Role |
-|:---------------|:--------------|:------------------|:----------------------|
-| `TFT_CS`       | **GPIO 5**    | Reclaimed Camera Y2 (FPC) | Hardware VSPI CS0 |
-| `TFT_SCK`      | **GPIO 18**   | Reclaimed Camera Y3 (FPC) | Hardware VSPI SCLK (~26 MHz) |
-| `TFT_MOSI`     | **GPIO 19**   | Reclaimed Camera Y4 (FPC) | Hardware VSPI MOSI (9-bit packed stream) |
-| `TFT_RST`      | **GPIO 4** *(or 13)* | J1 Pin 8 (Header) | Active-low Display Reset (Freed via LED/MOSFET mod) |
-| `TFT_BL`       | **GPIO 4** / 3.3V | J1 Pin 8 / 3.3V Rail | Backlight LED (Direct 3.3V or PWM control) |
+| Display Signal | Assigned GPIO | FPC Physical Pin | Bus / Peripheral Role | Overlap / Conflict Status |
+|:---------------|:--------------|:-----------------|:----------------------|:--------------------------|
+| **`TFT_CS`**   | **GPIO 5**    | `Cam1` Pin 6 (`CSI_D0`) | Hardware VSPI CS0 | **Zero conflicts** |
+| **`TFT_SCK`**  | **GPIO 18**   | `Cam1` Pin 4 (`CSI_D1`) | Hardware VSPI SCLK (~26 MHz) | **Zero conflicts** |
+| **`TFT_MOSI`** | **GPIO 19**   | `Cam1` Pin 3 (`CSI_D2`) | Hardware VSPI MOSI (9-bit packed) | **Zero conflicts** |
+| **`TFT_RST`**  | **GPIO 21**   | `Cam1` Pin 5 (`CSI_D3`) | Active-low Display Reset | **Zero conflicts (SDMMC DAT3 freed!)** |
+| **`TFT_BL`**   | **GPIO 22**   | `Cam1` Pin 8 (`CSI_PCLK`)| Optional Backlight PWM Dimming | **Zero conflicts** (or tie to 3.3V) |
+| **`TFT_VCC`**  | **3.3V**      | `Cam1` Pin 14 (`DOVDD`) | Main 3.3V Power Rail | Filtered by on-board `C14` (0.1µF) |
+| **`TFT_GND`**  | **GND**       | `Cam1` Pin 10 (`DGND`)  | System Ground | Direct PCB Ground |
 
-*Alternative Reclaimed Camera Pins for Display / Controls:*
-* If avoiding the SDMMC pins entirely:
-  * `TFT_RST` can be assigned to **GPIO 21** (Camera PCLK), **GPIO 26** (Camera SIOD), or **GPIO 27** (Camera VSYNC).
-  * `TFT_CS` can be moved to **GPIO 25** or **GPIO 32** if desired.
+*Key Advantage:* Connecting the display to the camera connector completely isolates the display from the MicroSD card lines, allowing full **4-Bit SDMMC Mode** on GPIO 2, 4, 12, 13, 14, 15 without any line contention!
 
 ---
 

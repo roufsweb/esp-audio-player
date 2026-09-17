@@ -9,11 +9,12 @@
 extern "C" {
 #endif
 
-/* Hardware Pinout for ESP32-CAM HW-297 (Reclaimed Camera & Freed SDMMC DAT3) */
-#define DISPLAY_PIN_CS    5     /* Camera Y2 */
-#define DISPLAY_PIN_SCK   18    /* Camera Y3 */
-#define DISPLAY_PIN_MOSI  19    /* Camera Y4 */
-#define DISPLAY_PIN_RST   13    /* Freed SDMMC DAT3 in 1-bit mode */
+/* Hardware Pinout for Nokia C1-01 LCD (100% Reclaimed Camera FPC Connector - Zero SDMMC Conflicts) */
+#define DISPLAY_PIN_CS    5     /* Cam1 Pin 6  (CSI_D0 / Hardware VSPI CS0) */
+#define DISPLAY_PIN_SCK   18    /* Cam1 Pin 4  (CSI_D1 / Hardware VSPI SCLK) */
+#define DISPLAY_PIN_MOSI  19    /* Cam1 Pin 3  (CSI_D2 / Hardware VSPI MOSI) */
+#define DISPLAY_PIN_RST   21    /* Cam1 Pin 5  (CSI_D3 / Display Reset - Zero SD conflicts) */
+#define DISPLAY_PIN_BL    22    /* Cam1 Pin 8  (CSI_PCLK / Optional Backlight PWM) */
 
 /**
  * @brief Initialize the Nokia C1-01 display subsystem on SPI3_HOST (VSPI).
