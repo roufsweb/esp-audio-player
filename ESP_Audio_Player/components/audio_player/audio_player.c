@@ -21,7 +21,7 @@
 #define DR_FLAC_NO_CRC                  /* Eliminate software CRC checks for 30-50% CPU boost */
 #define DR_FLAC_NO_SIMD                 /* Xtensa LX6 has no x86/ARM SIMD */
 #define DR_FLAC_NO_PICTURE_METADATA_MALLOC /* Never allocate RAM for embedded album art */
-#define DR_FLAC_BUFFER_SIZE 32768       /* 32 KB stream buffer: matches 64x SDMMC sectors (32 KB multi-block DMA) */
+#define DR_FLAC_BUFFER_SIZE 4096        /* 4 KB stream buffer: fits comfortably in internal SRAM without heap fragmentation */
 #include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";

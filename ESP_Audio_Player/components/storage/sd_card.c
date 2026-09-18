@@ -32,13 +32,13 @@ esp_err_t sd_card_init(void)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 32 * 1024
+        .allocation_unit_size = 16 * 1024
     };
 
-    /* Initialize SDMMC host in 1-bit high-speed mode (40 MHz) */
+    /* Initialize SDMMC host in 1-bit mode (20 MHz rock-solid mode for all cards including SDSC) */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; /* 40 MHz high-speed mode (doubles theoretical throughput to 5.0 MB/s) */
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
     /* Configure Slot 1 for 1-bit width */
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -338,8 +338,8 @@ static int cmd_sd_bench(int argc, char **argv)
         return 1;
     }
 
-    /* Allocate 32 KB test buffer matching our new allocation unit size */
-    const size_t buf_size = 32 * 1024;
+    /* Allocate 16 KB test buffer */
+    const size_t buf_size = 16 * 1024;
     uint8_t *buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf) {
         buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
