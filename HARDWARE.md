@@ -124,10 +124,10 @@ The Nokia C1-01 display uses a 9-bit SPI protocol (1 D/C bit + 8 data bits packe
 | 27   | Camera VSYNC         | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
 | 32   | Camera XCLK          | Available GPIO    | Reclaimed CAM FPC | Reclaimed general output/input |
 | 33   | Small Status LED     | System Status LED | Onboard Red LED   | Inverted active-low indicator |
-| 34   | Camera Y7            | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
-| 35   | Camera Y8            | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
-| 36   | Camera Y5 (VP)       | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
-| 39   | Camera Y6 (VN)       | Button Input      | Reclaimed CAM FPC | Input-only pin (requires external pull-up) |
+| 34   | Camera Y7 / J2-5     | **Battery ADC1**  | Header J2 Pin 5   | ADC1_CH6: Li-Ion 2:1 divider (active with BT) |
+| 35   | Camera Y8 / J2-4     | **Rotary Phase A**| Header J2 Pin 4   | Input-only digital input |
+| 36   | Camera Y5 (VP)       | Reclaimed CAM FPC | FPC Pin 15        | Input-only pin (ADC1_CH0) |
+| 39   | Camera Y6 (VN)       | **Rotary Phase B**| FPC Pin 13        | Input-only digital input (Sensor VN) |
 
 ---
 

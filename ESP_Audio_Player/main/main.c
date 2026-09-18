@@ -22,6 +22,7 @@
 #include "audio_player.h"
 #include "bt_manager.h"
 #include "display_manager.h"
+#include "battery.h"
 
 static const char *TAG = "A2DP_SRC";
 
@@ -189,6 +190,14 @@ static int cmd_rew(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_battery(int argc, char **argv) {
+    uint32_t mv = battery_get_millivolts();
+    uint8_t pct = battery_get_percentage();
+    printf("Battery: %u%% (%lu mV, GPIO 34)\n", pct, (unsigned long)mv);
+    return 0;
+}
+
+
 static int cmd_status(int argc, char **argv) {
     audio_player_status_t ap_status;
     audio_player_get_status(&ap_status);
@@ -329,7 +338,10 @@ static int cmd_status_json(int argc, char **argv)
         clean_codec[i] = (c >= 32 && c <= 126 && c != '"' && c != '\\') ? c : ' ';
     }
 
-    printf("{\"type\":\"status\",\"state\":\"%s\",\"source\":\"%s\",\"file\":\"%s\",\"sample_rate\":%lu,\"bits\":%u,\"channels\":%u,\"pos\":%lu,\"total\":%lu,\"pos_sec\":%lu,\"total_sec\":%lu,\"volume\":%u,\"bt_state\":\"%s\",\"sink_name\":\"%s\",\"sink_mac\":\"%s\",\"bt_codec\":\"%s\",\"bt_bitrate\":%lu,\"bt_bitpool\":%u,\"bt_rate\":%lu,\"scanning\":%s,\"sram\":%lu,\"psram\":%lu,\"buf\":%lu}\n",
+    uint8_t batt_pct = battery_get_percentage();
+    uint32_t batt_mv = battery_get_millivolts();
+
+    printf("{\"type\":\"status\",\"state\":\"%s\",\"source\":\"%s\",\"file\":\"%s\",\"sample_rate\":%lu,\"bits\":%u,\"channels\":%u,\"pos\":%lu,\"total\":%lu,\"pos_sec\":%lu,\"total_sec\":%lu,\"volume\":%u,\"bt_state\":\"%s\",\"sink_name\":\"%s\",\"sink_mac\":\"%s\",\"bt_codec\":\"%s\",\"bt_bitrate\":%lu,\"bt_bitpool\":%u,\"bt_rate\":%lu,\"scanning\":%s,\"sram\":%lu,\"psram\":%lu,\"buf\":%lu,\"batt_pct\":%u,\"batt_mv\":%lu}\n",
            state_str, src_str, ap_status.current_path,
            (unsigned long)ap_status.sample_rate, (unsigned)ap_status.bit_depth, (unsigned)ap_status.channels,
            (unsigned long)ap_status.played_audio_bytes, (unsigned long)ap_status.total_audio_bytes,
@@ -338,7 +350,8 @@ static int cmd_status_json(int argc, char **argv)
            bt_state_str, clean_name, clean_mac,
            clean_codec, (unsigned long)bt_status.bitrate_kbps, (unsigned)bt_status.bitpool, (unsigned long)bt_status.sample_rate,
            bt_status.is_scanning ? "true" : "false",
-           (unsigned long)sram_free, (unsigned long)psram_free, (unsigned long)buf_bytes);
+           (unsigned long)sram_free, (unsigned long)psram_free, (unsigned long)buf_bytes,
+           (unsigned)batt_pct, (unsigned long)batt_mv);
     return 0;
 }
 
@@ -585,6 +598,14 @@ void register_console_commands(void)
         .func = &cmd_rew,
     };
     esp_console_cmd_register(&rew_cmd);
+
+    esp_console_cmd_t batt_cmd = {
+        .command = "battery",
+        .help = "Read battery voltage and percentage on GPIO 34 (ADC1_CH6)",
+        .hint = NULL,
+        .func = &cmd_battery,
+    };
+    esp_console_cmd_register(&batt_cmd);
 }
 
 static void main_media_ctrl_cb(audio_player_cmd_t cmd)
@@ -614,6 +635,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Initialize Battery Monitor on GPIO 34 */
+    battery_init();
 
     /* Initialize Audio Player Engine */
     ESP_ERROR_CHECK(audio_player_init());

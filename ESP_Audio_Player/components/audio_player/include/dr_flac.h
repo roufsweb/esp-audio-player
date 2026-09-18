@@ -5307,11 +5307,10 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             return DRFLAC_FALSE;
         }
 
-#ifndef DR_FLAC_NO_CRC
+        /* CRC-8 header check: always enforce to prevent binary search from locking onto false frame syncs */
         if (header->crc8 != crc8) {
             continue;    /* CRC mismatch. Loop back to the top and find the next sync code. */
         }
-#endif
         return DRFLAC_TRUE;
     }
 }
@@ -5864,7 +5863,7 @@ static drflac_bool32 drflac__seek_to_pcm_frame__brute_force(drflac* pFlac, drfla
 }
 
 
-#if !defined(DR_FLAC_NO_CRC)
+#if 1 /* Enable high-speed binary search seek even with zero stream CRC overhead */
 /*
 We use an average compression ratio to determine our approximate start location. FLAC files are generally about 50%-70% the size of their
 uncompressed counterparts so we'll use this as a basis. I'm going to split the middle and use a factor of 0.6 to determine the starting
@@ -6095,7 +6094,7 @@ static drflac_bool32 drflac__seek_to_pcm_frame__binary_search(drflac* pFlac, drf
 
     return drflac__seek_to_pcm_frame__binary_search_internal(pFlac, pcmFrameIndex, byteRangeLo, byteRangeHi);
 }
-#endif  /* !DR_FLAC_NO_CRC */
+#endif  /* Binary search seek */
 
 static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac_uint64 pcmFrameIndex)
 {
@@ -6132,7 +6131,7 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
         return DRFLAC_FALSE;
     }
 
-#if !defined(DR_FLAC_NO_CRC)
+#if 1
     /* At this point we should know the closest seek point. We can use a binary search for this. We need to know the total sample count for this. */
     if (pFlac->totalPCMFrameCount > 0) {
         drflac_uint64 byteRangeLo;
@@ -6171,7 +6170,7 @@ static drflac_bool32 drflac__seek_to_pcm_frame__seek_table(drflac* pFlac, drflac
             }
         }
     }
-#endif  /* !DR_FLAC_NO_CRC */
+#endif  /* Seektable binary search */
 
     /* Getting here means we need to use a slower algorithm because the binary search method failed or cannot be used. */
 
@@ -11852,7 +11851,7 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
                 wasSuccessful = drflac__seek_to_pcm_frame__seek_table(pFlac, pcmFrameIndex);
             }
 
-#if !defined(DR_FLAC_NO_CRC)
+#if 1
             /* Fall back to binary search if seek table seeking fails. This requires the length of the stream to be known. */
             if (!wasSuccessful && !pFlac->_noBinarySearchSeek && pFlac->totalPCMFrameCount > 0) {
                 wasSuccessful = drflac__seek_to_pcm_frame__binary_search(pFlac, pcmFrameIndex);

@@ -1256,7 +1256,16 @@ esp_err_t audio_player_seek(uint32_t target_sec)
     if (!s_lock) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) != pdTRUE) return ESP_ERR_TIMEOUT;
 
+    uint32_t total_sec = 0;
+
     if (s_source == AUDIO_SOURCE_FLAC && s_flac != NULL) {
+        if (s_flac_sample_rate > 0) {
+            total_sec = (uint32_t)(s_flac->totalPCMFrameCount / s_flac_sample_rate);
+        }
+        if (total_sec > 0 && target_sec > total_sec) {
+            target_sec = total_sec;
+        }
+
         uint64_t target_frame = (uint64_t)target_sec * s_flac_sample_rate;
         if (target_frame > s_flac->totalPCMFrameCount) {
             target_frame = s_flac->totalPCMFrameCount;
@@ -1280,6 +1289,13 @@ esp_err_t audio_player_seek(uint32_t target_sec)
         return ESP_OK;
     } else if (s_source == AUDIO_SOURCE_WAV && s_wav_file != NULL) {
         uint32_t bytes_per_sec = s_wav_sample_rate * s_wav_channels * (s_wav_bit_depth / 8);
+        if (bytes_per_sec > 0) {
+            total_sec = s_wav_total_bytes / bytes_per_sec;
+        }
+        if (total_sec > 0 && target_sec > total_sec) {
+            target_sec = total_sec;
+        }
+
         uint32_t target_byte = target_sec * bytes_per_sec;
         if (target_byte > s_wav_total_bytes) {
             target_byte = s_wav_total_bytes;
@@ -1288,6 +1304,9 @@ esp_err_t audio_player_seek(uint32_t target_sec)
         s_wav_played_bytes = target_byte;
         ring_flush();
         s_decode_eof = false;
+        s_hb_idx = 0;
+        memset(s_hb_delay_l, 0, sizeof(s_hb_delay_l));
+        memset(s_hb_delay_r, 0, sizeof(s_hb_delay_r));
         s_src_phase = 0;
         s_src_prev_l = 0;
         s_src_prev_r = 0;
