@@ -21,7 +21,7 @@
 #define DR_FLAC_NO_CRC                  /* Eliminate software CRC checks for 30-50% CPU boost */
 #define DR_FLAC_NO_SIMD                 /* Xtensa LX6 has no x86/ARM SIMD */
 #define DR_FLAC_NO_PICTURE_METADATA_MALLOC /* Never allocate RAM for embedded album art */
-#define DR_FLAC_BUFFER_SIZE 4096        /* 4 KB stream buffer: matches 8x SDMMC sectors (512B) and fits comfortably in task stack */
+#define DR_FLAC_BUFFER_SIZE 32768       /* 32 KB stream buffer: matches 64x SDMMC sectors (32 KB multi-block DMA) */
 #include "dr_flac.h"
 
 static const char *TAG = "AUDIO_PLAYER";
@@ -123,10 +123,13 @@ static const int16_t s_hb_fir_coeff[12] = {
   32767,   /* h[11] = center tap */
 };
 
-/* Delay-line history for the FIR filter (stereo interleaved: L0,R0,L1,R1,...)
- * Size = HB_FIR_TAPS - 1 = 22 samples × 2 channels = 44 int16_t entries. */
-static int16_t s_hb_delay_l[HB_FIR_TAPS] = {0};
-static int16_t s_hb_delay_r[HB_FIR_TAPS] = {0};
+/* Double-buffered circular delay-line to eliminate array shifting and modulo operations.
+ * Capacity = 2 * HB_FIR_TAPS = 46 entries.
+ * Writing spl to both s_hb_delay_l[s_hb_idx] and s_hb_delay_l[s_hb_idx + HB_FIR_TAPS]
+ * guarantees any tap offset 0..HB_FIR_TAPS-1 is accessed contiguously without wrap checks. */
+static int16_t s_hb_delay_l[2 * HB_FIR_TAPS] = {0};
+static int16_t s_hb_delay_r[2 * HB_FIR_TAPS] = {0};
+static uint32_t s_hb_idx = 0;
 
 /* ----------------------------------------------------------------
  * resample_96k_to_48k_halfband
@@ -152,28 +155,27 @@ static uint32_t resample_96k_to_48k_halfband(
         int16_t spl  = p[i * 2];
         int16_t spr  = p[i * 2 + 1];
 
-        /* Shift delay lines */
-        for (int k = HB_FIR_TAPS - 1; k > 0; k--) {
-            s_hb_delay_l[k] = s_hb_delay_l[k - 1];
-            s_hb_delay_r[k] = s_hb_delay_r[k - 1];
-        }
-        s_hb_delay_l[0] = spl;
-        s_hb_delay_r[0] = spr;
+        /* Advance circular write index backwards so older samples are at increasing offsets */
+        s_hb_idx = (s_hb_idx == 0) ? (HB_FIR_TAPS - 1) : (s_hb_idx - 1);
+        s_hb_delay_l[s_hb_idx] = spl;
+        s_hb_delay_l[s_hb_idx + HB_FIR_TAPS] = spl;
+        s_hb_delay_r[s_hb_idx] = spr;
+        s_hb_delay_r[s_hb_idx + HB_FIR_TAPS] = spr;
 
         /* Output one frame for every two input frames */
         if (i & 1) {
             int32_t accl = 0, accr = 0;
 
             /* Center tap (h[11] = 32767): multiply delay_line[11] */
-            accl += (int32_t)s_hb_delay_l[HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
-            accr += (int32_t)s_hb_delay_r[HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
+            accl += (int32_t)s_hb_delay_l[s_hb_idx + HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
+            accr += (int32_t)s_hb_delay_r[s_hb_idx + HB_FIR_HALF] * (int32_t)s_hb_fir_coeff[HB_FIR_HALF];
 
             /* Symmetric non-zero taps (even index from center = 0, skip; odd = non-zero) */
             for (int t = 0; t < HB_FIR_HALF; t += 2) {
                 int32_t cl = s_hb_fir_coeff[t];
                 if (cl == 0) continue;
-                accl += cl * ((int32_t)s_hb_delay_l[t] + (int32_t)s_hb_delay_l[HB_FIR_TAPS - 1 - t]);
-                accr += cl * ((int32_t)s_hb_delay_r[t] + (int32_t)s_hb_delay_r[HB_FIR_TAPS - 1 - t]);
+                accl += cl * ((int32_t)s_hb_delay_l[s_hb_idx + t] + (int32_t)s_hb_delay_l[s_hb_idx + (HB_FIR_TAPS - 1 - t)]);
+                accr += cl * ((int32_t)s_hb_delay_r[s_hb_idx + t] + (int32_t)s_hb_delay_r[s_hb_idx + (HB_FIR_TAPS - 1 - t)]);
             }
 
             /* Q15 shift: divide by 32768 */
@@ -249,6 +251,7 @@ static void close_active_file(void)
     s_src_prev_l = 0;
     s_src_prev_r = 0;
     /* Reset FIR delay lines so next track starts clean */
+    s_hb_idx = 0;
     memset(s_hb_delay_l, 0, sizeof(s_hb_delay_l));
     memset(s_hb_delay_r, 0, sizeof(s_hb_delay_r));
 }
@@ -1265,6 +1268,7 @@ esp_err_t audio_player_seek(uint32_t target_sec)
         s_flac_played_bytes = (uint32_t)(target_frame * s_flac_channels * 2);
         ring_flush();
         s_decode_eof = false;
+        s_hb_idx = 0;
         memset(s_hb_delay_l, 0, sizeof(s_hb_delay_l));
         memset(s_hb_delay_r, 0, sizeof(s_hb_delay_r));
         s_src_phase = 0;
@@ -1684,20 +1688,13 @@ void audio_player_benchmark(const char *path, uint32_t max_audio_sec)
         t0 = esp_timer_get_time();
         uint32_t dec_out_total = 0;
         for (int iter = 0; iter < 100; iter++) {
-            uint32_t out_frames = 1024 / 2;
-            for (uint32_t i = 0; i < out_frames; i++) {
-                uint32_t in_idx = i * 2;
-                int32_t l = ((int32_t)synth_in[in_idx * 2] + (int32_t)synth_in[(in_idx + 1) * 2]) >> 1;
-                int32_t r = ((int32_t)synth_in[in_idx * 2 + 1] + (int32_t)synth_in[(in_idx + 1) * 2 + 1]) >> 1;
-                synth_out[i * 2]     = (int16_t)l;
-                synth_out[i * 2 + 1] = (int16_t)r;
-            }
+            uint32_t out_frames = resample_96k_to_48k_halfband(synth_in, 1024, synth_out);
             dec_out_total += out_frames;
         }
         t1 = esp_timer_get_time();
         int64_t us_dec = t1 - t0;
         double cpu_pct_dec = ((double)us_dec / (100.0 * 1024.0 / 96000.0 * 1000000.0)) * 100.0;
-        printf("  B. 96k -> 48.0k Integer 2:1 Decimator: 102,400 frames in %.2f ms (CPU Load: %.2f%%)\n\n",
+        printf("  B. 96k -> 48.0k Half-Band FIR Decimator: 102,400 frames in %.2f ms (CPU Load: %.2f%%)\n\n",
                (double)us_dec / 1000.0, cpu_pct_dec);
 
         free(synth_in);

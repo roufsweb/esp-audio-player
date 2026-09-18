@@ -13,6 +13,7 @@
 #include "sdmmc_cmd.h"
 #include "esp_heap_caps.h"
 #include "esp_console.h"
+#include "esp_timer.h"
 
 static const char *TAG = "SD_CARD";
 
@@ -31,13 +32,13 @@ esp_err_t sd_card_init(void)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 16 * 1024
+        .allocation_unit_size = 32 * 1024
     };
 
-    /* Initialize SDMMC host in 1-bit mode */
+    /* Initialize SDMMC host in 1-bit high-speed mode (40 MHz) */
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT; /* 20 MHz rock-solid mode for 1-bit internal pullup bus */
+    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED; /* 40 MHz high-speed mode (doubles theoretical throughput to 5.0 MB/s) */
 
     /* Configure Slot 1 for 1-bit width */
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -293,6 +294,102 @@ static int cmd_mem(int argc, char **argv)
     return 0;
 }
 
+static int cmd_sd_bench(int argc, char **argv)
+{
+    if (!s_is_mounted) {
+        printf("Error: SD card is not mounted.\n");
+        return 1;
+    }
+
+    const char *target_path = NULL;
+    char auto_path[512] = {0};
+
+    if (argc > 1) {
+        if (argv[1][0] == '/') {
+            target_path = argv[1];
+        } else {
+            snprintf(auto_path, sizeof(auto_path), "%s/%s", SD_CARD_MOUNT_POINT, argv[1]);
+            target_path = auto_path;
+        }
+    } else {
+        /* Auto-discover first regular audio or data file in /sdcard */
+        DIR *dir = opendir(SD_CARD_MOUNT_POINT);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_type == DT_REG && entry->d_name[0] != '.') {
+                    snprintf(auto_path, sizeof(auto_path), "%s/%s", SD_CARD_MOUNT_POINT, entry->d_name);
+                    target_path = auto_path;
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    if (!target_path) {
+        printf("Error: No file specified and no suitable files found in %s to benchmark.\n", SD_CARD_MOUNT_POINT);
+        return 1;
+    }
+
+    FILE *f = fopen(target_path, "rb");
+    if (!f) {
+        printf("Error: Failed to open file: %s\n", target_path);
+        return 1;
+    }
+
+    /* Allocate 32 KB test buffer matching our new allocation unit size */
+    const size_t buf_size = 32 * 1024;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = (uint8_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!buf) {
+        buf = (uint8_t *)malloc(buf_size);
+    }
+    if (!buf) {
+        printf("Error: Failed to allocate 32 KB benchmark buffer.\n");
+        fclose(f);
+        return 1;
+    }
+
+    printf("\n=== MICROSD READ SPEED BENCHMARK ===\n");
+    printf("Target File:  %s\n", target_path);
+    printf("Chunk Size:   %u KB (Multi-Block DMA)\n", (unsigned)(buf_size / 1024));
+    printf("Bus Mode:     1-Bit SDMMC @ %lu MHz\n", (unsigned long)(s_card ? s_card->real_freq_khz / 1000 : 0));
+    printf("Benchmarking 4 MB sequential read throughput...\n");
+
+    const size_t target_total = 4 * 1024 * 1024; /* 4 MB */
+    size_t total_read = 0;
+    int64_t t_start = esp_timer_get_time();
+
+    while (total_read < target_total) {
+        size_t n = fread(buf, 1, buf_size, f);
+        if (n == 0) {
+            /* If file is smaller than 4MB, rewind to continue sustained benchmark */
+            fseek(f, 0, SEEK_SET);
+            n = fread(buf, 1, buf_size, f);
+            if (n == 0) break;
+        }
+        total_read += n;
+    }
+
+    int64_t t_end = esp_timer_get_time();
+    int64_t elapsed_us = t_end - t_start;
+    double elapsed_sec = (double)elapsed_us / 1000000.0;
+    double speed_kb_s = (elapsed_sec > 0.0) ? (((double)total_read / 1024.0) / elapsed_sec) : 0.0;
+    double speed_mb_s = speed_kb_s / 1024.0;
+
+    printf("Bytes Read:   %lu KB (%.2f MB)\n", (unsigned long)(total_read / 1024), (double)total_read / (1024.0 * 1024.0));
+    printf("Elapsed Time: %.3f seconds\n", elapsed_sec);
+    printf("Throughput:   %.2f MB/s (%.1f KB/s)\n", speed_mb_s, speed_kb_s);
+    printf("====================================\n\n");
+
+    free(buf);
+    fclose(f);
+    return 0;
+}
+
 void sd_card_register_console_commands(void)
 {
     esp_console_cmd_t mount_cmd = {
@@ -342,4 +439,12 @@ void sd_card_register_console_commands(void)
         .func = &cmd_mem,
     };
     esp_console_cmd_register(&mem_cmd);
+
+    esp_console_cmd_t sdbench_cmd = {
+        .command = "sd_bench",
+        .help = "Benchmark sequential MicroSD read throughput in MB/s",
+        .hint = "[filename]",
+        .func = &cmd_sd_bench,
+    };
+    esp_console_cmd_register(&sdbench_cmd);
 }
