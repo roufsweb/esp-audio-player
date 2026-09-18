@@ -34,3 +34,11 @@ These rules govern all engineering, development, and documentation work on this 
 - Clearly present the circuit implications, signal conflicts, timing constraints, and verification steps in the plan first.
 - STOP and obtain explicit user alignment and approval on the implementation plan before executing code changes or modifying hardware configurations.
 
+## 7. Proactive Conflict Analysis & In-Flight Bug Elimination
+- Whenever adding a feature, optimization, or refactoring, proactively audit for side-effects, peripheral resource conflicts, and memory allocation hazards before committing:
+  - **Internal SRAM Budget**: Never allocate large buffers (>8 KB) in internal SRAM without verifying contiguous headroom (`heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)`). Avoid starving critical FreeRTOS or Newlib stdio allocations.
+  - **DMA Memory Compatibility**: Remember that ESP32 hardware DMA (SDMMC, SPI, I2S) cannot access PSRAM directly without CPU bounce buffers. Ensure DMA buffers remain strictly in internal SRAM (`MALLOC_CAP_DMA`).
+  - **Hardware Bus Limits**: Never overclock peripheral clocks (e.g. SDMMC host) beyond the physical specifications of attached media (e.g. SDSC cards are rated at 25 MHz maximum; SDHC/SDXC support 50 MHz High-Speed mode).
+  - **Cross-Task Concurrency**: Ensure mutexes, queues, and task priorities are balanced so decoder tasks do not starve Bluetooth callbacks, network threads, or console REPL.
+- If any conflicting behavior, warning, or regression appears during testing, diagnose the exact root cause and fix it immediately before proceeding.
+
